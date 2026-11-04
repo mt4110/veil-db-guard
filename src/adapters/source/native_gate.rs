@@ -41,6 +41,7 @@ pub fn evaluate(change: &PreparedChange, state: &StateReportV2) -> Vec<NativeSte
         .iter()
         .filter(|s| {
             requires_source_evidence(s.action)
+                || s.action == ActionKind::CompensateOwnedIam
                 || (s.adapter_contract == SOURCE_BOUND_EXECUTION_CONTRACT
                     && matches!(
                         s.action,
@@ -77,7 +78,9 @@ pub fn evaluate(change: &PreparedChange, state: &StateReportV2) -> Vec<NativeSte
                 .filter(|r| r.assessment != StateAssessment::Satisfied)
                 .map(|r| r.desired.id.clone())
                 .collect::<Vec<_>>();
-            let executable = s.adapter_contract == SOURCE_BOUND_EXECUTION_CONTRACT;
+            let compensation = s.action == ActionKind::CompensateOwnedIam
+                && s.adapter_contract == crate::core::plan::OWNED_IAM_COMPENSATION_CONTRACT;
+            let executable = s.adapter_contract == SOURCE_BOUND_EXECUTION_CONTRACT || compensation;
             let contract = s.adapter_contract == SOURCE_BOUND_ADAPTER_CONTRACT || executable;
             let satisfied = !required.is_empty() && unsatisfied.is_empty();
             NativeStepEvidence {
@@ -94,7 +97,7 @@ pub fn evaluate(change: &PreparedChange, state: &StateReportV2) -> Vec<NativeSte
                 } else {
                     None
                 },
-                after_configuration: if executable {
+                after_configuration: if executable && !compensation {
                     stage_check(
                         change,
                         s,

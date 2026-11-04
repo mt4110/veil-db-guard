@@ -24,6 +24,8 @@ pub enum CheckpointArg {
     ApplicationCutover,
     ExclusiveNativeChangeWindow,
     NativePreparationReady,
+    /// Attest that the selected SA is unused by workloads and recovery during the exclusive change window.
+    OwnedIamCompensationReady,
 }
 impl From<CheckpointArg> for crate::binding::CheckpointKind {
     fn from(value: CheckpointArg) -> Self {
@@ -33,6 +35,7 @@ impl From<CheckpointArg> for crate::binding::CheckpointKind {
             CheckpointArg::ApplicationCutover => Self::ApplicationCutover,
             CheckpointArg::ExclusiveNativeChangeWindow => Self::ExclusiveNativeChangeWindow,
             CheckpointArg::NativePreparationReady => Self::NativePreparationReady,
+            CheckpointArg::OwnedIamCompensationReady => Self::OwnedIamCompensationReady,
         }
     }
 }
@@ -51,9 +54,19 @@ pub struct MaintenanceArgs {
     #[arg(long)]
     revoke_sql: bool,
 }
+#[derive(Debug, clap::Args)]
+pub struct RecoverArgs {
+    #[command(flatten)]
+    maintenance: MaintenanceArgs,
+    /// Plan removal of only the conditional IAM bindings proven to be Veil-owned.
+    #[arg(long, conflicts_with_all = ["evidence", "revoke_sql"])]
+    compensate_owned_iam: bool,
+}
+
 fn maintenance(
     args: MaintenanceArgs,
     kind: crate::core::lifecycle::LifecycleKind,
+    compensate_owned_iam: bool,
 ) -> Result<i32, GuardError> {
     let ledger = OperationStore::open_existing(&args.ledger)?;
     let source_op = ledger.get(&args.source_operation)?;
@@ -91,17 +104,30 @@ fn maintenance(
         .transpose()?;
     let capabilities =
         adapters::capabilities_for_policy(&source.policy).map_err(|_| GuardError::ConfigInvalid)?;
-    let change = crate::core::lifecycle::prepare_maintenance(
-        &source,
-        &args.source_operation,
-        kind,
-        &args.grant,
-        observed.as_slice(),
-        capabilities,
-        at,
-        source.limits.clone(),
-        args.revoke_sql,
-    )?;
+    let change = if compensate_owned_iam {
+        let receipt = ledger.owned_iam_compensation_source(&args.source_operation, &args.grant)?;
+        let mut limits = source.limits.clone();
+        limits.max_repair_executions = 0;
+        crate::core::lifecycle::prepare_owned_iam_compensation(
+            &source,
+            &receipt,
+            &args.grant,
+            at,
+            limits,
+        )?
+    } else {
+        crate::core::lifecycle::prepare_maintenance(
+            &source,
+            &args.source_operation,
+            kind,
+            &args.grant,
+            observed.as_slice(),
+            capabilities,
+            at,
+            source.limits.clone(),
+            args.revoke_sql,
+        )?
+    };
     let intent_qualification = crate::qualification_cli::report(&change)?;
     let mut run = RunWriter::create_for_config(
         &args.out,
@@ -117,7 +143,11 @@ fn maintenance(
     if let Some(observed) = observed {
         run.write_json("snapshot.json", &observed)?;
     }
-    let mut report = "# Scoped lifecycle plan\n\nNo native changes performed. New bounded approval required. Reconcile/recover preserve current desired policy; revoke never restores Allow.\n".to_string();
+    let mut report = if compensate_owned_iam {
+        "# Owned IAM compensation plan\n\nThis plan advances the selected grant to Deny and removes only the owned conditional IAM pair. Independent recovery evidence and new bounded approval are required. Protection has not been evaluated.\n"
+    } else {
+        "# Scoped lifecycle plan\n\nNo native changes performed. New bounded approval required. Reconcile/recover preserve current desired policy; revoke never restores Allow.\n"
+    }.to_string();
     crate::qualification_cli::append_report(&mut report, &intent_qualification)?;
     run.write_bytes("report.md", report.as_bytes())?;
     run.finish(RunStatus::Complete)?;
@@ -146,7 +176,7 @@ pub enum GuardCommand {
     /// Plan a bounded repair of current desired protection; no native I/O.
     Reconcile(MaintenanceArgs),
     /// Plan recovery of current desired protection from a stopped/failed operation.
-    Recover(MaintenanceArgs),
+    Recover(RecoverArgs),
     /// Advance the selected grant to Deny and plan narrow revocation.
     Revoke(MaintenanceArgs),
     /// Evaluate a verified local observation run against the exact policy.
@@ -395,14 +425,18 @@ pub fn execute_with_cancel(
         GuardCommand::ObservePlan(args) => crate::observation_cli::plan(args),
         GuardCommand::ObservationIssue(args) => crate::observation_cli::issue(args),
         GuardCommand::Observe(args) => crate::observation_cli::observe(args, cancel),
-        GuardCommand::Reconcile(args) => {
-            maintenance(args, crate::core::lifecycle::LifecycleKind::Reconcile)
-        }
-        GuardCommand::Recover(args) => {
-            maintenance(args, crate::core::lifecycle::LifecycleKind::Recover)
-        }
+        GuardCommand::Reconcile(args) => maintenance(
+            args,
+            crate::core::lifecycle::LifecycleKind::Reconcile,
+            false,
+        ),
+        GuardCommand::Recover(args) => maintenance(
+            args.maintenance,
+            crate::core::lifecycle::LifecycleKind::Recover,
+            args.compensate_owned_iam,
+        ),
         GuardCommand::Revoke(args) => {
-            maintenance(args, crate::core::lifecycle::LifecycleKind::Revoke)
+            maintenance(args, crate::core::lifecycle::LifecycleKind::Revoke, false)
         }
         GuardCommand::State {
             ledger,
@@ -761,7 +795,14 @@ pub fn execute_with_cancel(
                     })
                     .transpose()?;
                 let output = if let Some(op) = op {
-                    serde_json::json!({"operation_only":!source.effective.protection_evaluated,"native_dispatch_available":false,"operation_scope_completed":op.state==ExecutionState::Completed,"protection_evaluated":source.effective.protection_evaluated,"native_queries_performed":false,"local_evidence_rechecked":true,"operation":op,"desired":context_change.policy,"effective":source.effective,"source_coverage":source.source_coverage,"native_step_evidence":source.native_step_evidence,"admission_reads":source.admission_reads,"native_observation":native_observation,"steps":store.steps(&operation)?,"events":store.events(&operation)?})
+                    let steps = store.steps(&operation)?;
+                    let mut output = serde_json::json!({"operation_only":!source.effective.protection_evaluated,"native_dispatch_available":false,"operation_scope_completed":op.state==ExecutionState::Completed,"protection_evaluated":source.effective.protection_evaluated,"native_queries_performed":false,"local_evidence_rechecked":true,"operation":op,"desired":context_change.policy,"effective":source.effective,"source_coverage":source.source_coverage,"native_step_evidence":source.native_step_evidence,"admission_reads":source.admission_reads,"native_observation":native_observation,"steps":steps,"events":store.events(&operation)?});
+                    crate::qualification_cli::annotate_owned_iam(
+                        &context_change,
+                        &steps,
+                        &mut output,
+                    );
+                    output
                 } else {
                     if native_observation.is_some() {
                         return Err(GuardError::EvidenceIncompatible);

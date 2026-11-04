@@ -64,7 +64,9 @@ pub trait SourceStepGate: Send {
 
 pub fn execution_contract_matches(change: &PreparedChange, step: &PlanStep, legacy: &str) -> bool {
     step.adapter_contract
-        == if change.policy.schema_version == 2 {
+        == if step.action == super::capability::ActionKind::CompensateOwnedIam {
+            super::plan::OWNED_IAM_COMPENSATION_CONTRACT
+        } else if change.policy.schema_version == 2 {
             SOURCE_BOUND_EXECUTION_CONTRACT
         } else {
             legacy
@@ -85,7 +87,9 @@ pub fn check_source_step(
         .map_err(|_| ExecutorError::PreconditionsNotMet)?;
     if change.policy.schema_version != 2
         || !change.plan.steps.contains(step)
-        || step.adapter_contract != SOURCE_BOUND_EXECUTION_CONTRACT
+        || !execution_contract_matches(change, step, SOURCE_BOUND_EXECUTION_CONTRACT)
+        || (step.action == super::capability::ActionKind::CompensateOwnedIam
+            && phase != SourceStepPhase::BeforeDispatch)
     {
         return Err(ExecutorError::Unavailable);
     }
@@ -130,6 +134,7 @@ pub(crate) fn stage_check(
         step.action,
         ConstrainDirectPath
             | DisableNativeIdentity
+            | CompensateOwnedIam
             | DisableNewConnections
             | RevokeSqlPrivileges
             | ObserveRevocation

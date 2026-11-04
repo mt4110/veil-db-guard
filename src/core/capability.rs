@@ -26,7 +26,8 @@ choice!(ActionKind {
     ObserveRevocation,
     DrainExistingSessions,
     TerminateSelectedSessions,
-    EnforceLeaseExpiry
+    EnforceLeaseExpiry,
+    CompensateOwnedIam
 });
 choice!(Support {
     Supported,

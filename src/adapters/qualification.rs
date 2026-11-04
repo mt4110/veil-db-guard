@@ -149,8 +149,15 @@ pub fn qualify_change(change: &PreparedChange) -> Result<QualificationReport, Qu
             QualificationDisposition::RuntimePrerequisite,
         )],
     };
-    let current_capabilities =
-        capabilities_for_policy(&change.policy).map_err(|_| QualificationError::InvalidChange)?;
+    let compensation = change.lifecycle.as_ref().is_some_and(|context| {
+        context.kind == crate::core::lifecycle::LifecycleKind::CompensateOwnedIam
+    });
+    let current_capabilities = if compensation {
+        // This descriptor exists only inside the verified single-purpose plan.
+        change.plan.capabilities.clone()
+    } else {
+        capabilities_for_policy(&change.policy).map_err(|_| QualificationError::InvalidChange)?
+    };
     if change.policy.schema_version == 2
         && !super::registry::source_execution_supported(&change.policy)
     {
@@ -180,7 +187,11 @@ pub fn qualify_change(change: &PreparedChange) -> Result<QualificationReport, Qu
             step_id: None,
             action: None,
             scope: QualificationScope::Grant,
-            disposition: QualificationDisposition::Unsupported,
+            disposition: if compensation {
+                QualificationDisposition::RuntimePrerequisite
+            } else {
+                QualificationDisposition::Unsupported
+            },
             reason: QualificationReason::RequiredEffectUnavailable,
         });
     }

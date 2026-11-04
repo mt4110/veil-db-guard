@@ -112,6 +112,7 @@ pub enum DifferenceField {
     RegisteredDbIdentity,
     SqlPrivileges,
     VerifiedTls,
+    OwnedGcpIamBindings,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -248,8 +249,24 @@ fn prepare_internal(
     }
     if let Some(context) = &lifecycle {
         context.validate(&policy, previous_policy, plan)?;
-        super::plan::verify_selected_plan(&policy, plan, Some(&context.selected_step_ids))
+        if let Some(receipt) = &context.owned_iam {
+            if limits.max_repair_executions != 0 {
+                return Err(ChangeError::Invalid);
+            }
+            let expected = super::plan::build_owned_iam_plan(
+                &policy,
+                receipt,
+                plan.created_at,
+                &plan.build_id,
+            )
             .map_err(|_| ChangeError::Tampered)?;
+            if json(&expected)? != json(plan)? {
+                return Err(ChangeError::Tampered);
+            }
+        } else {
+            super::plan::verify_selected_plan(&policy, plan, Some(&context.selected_step_ids))
+                .map_err(|_| ChangeError::Tampered)?;
+        }
     } else {
         verify_plan(&policy, plan).map_err(|_| ChangeError::Tampered)?;
     }
@@ -383,17 +400,39 @@ fn prepare_internal(
     }
 
     let previous_policy = previous_policy.map(PolicyRevision::normalized);
-    let differences = differences(
+    let mut differences = differences(
         &policy,
         previous_policy.as_ref(),
         &observations,
         plan.created_at,
     )?;
-    let conflict_keys = conflict_keys(&policy)?;
+    if let Some(receipt) = lifecycle
+        .as_ref()
+        .and_then(|context| context.owned_iam.as_ref())
+    {
+        let step = &plan.steps[0];
+        differences.retain(|difference| {
+            difference.field == DifferenceField::PolicyGrant
+                && difference.grant_id.as_ref() == Some(&step.grant_id)
+        });
+        differences.push(ScopedDifference {
+            target_id: step.target_id.clone(),
+            grant_id: Some(step.grant_id.clone()),
+            field: DifferenceField::OwnedGcpIamBindings,
+            kind: DifferenceKind::Removed,
+            before: Some(DifferenceValue::Digest(receipt.hash())),
+            desired: None,
+        });
+    }
+    let conflict_keys = conflict_keys(if plan.schema_version == 2 {
+        &plan.targets
+    } else {
+        &policy.targets
+    })?;
     let recovery = recovery(&policy, plan)?;
     let repair_recipes = repair_recipes(&policy, plan, &observations, &limits)?;
     let mut result = PreparedChange {
-        schema_version: 2,
+        schema_version: if plan.schema_version == 2 { 3 } else { 2 },
         change_hash: String::new(),
         policy,
         previous_policy,
@@ -414,10 +453,17 @@ impl PreparedChange {
     fn computed_hash(&self) -> Result<String, ChangeError> {
         let mut copy = self.clone();
         copy.change_hash.clear();
-        digest("prepared-change", &copy)
+        digest(
+            if self.schema_version == 3 {
+                "gcp-iam-owned-compensation-change"
+            } else {
+                "prepared-change"
+            },
+            &copy,
+        )
     }
     pub fn verify(&self) -> Result<(), ChangeError> {
-        if self.schema_version != 2 || !valid_hash(&self.change_hash) {
+        if !matches!(self.schema_version, 2 | 3) || !valid_hash(&self.change_hash) {
             return Err(ChangeError::Invalid);
         }
         let canonical = prepare_internal(
@@ -434,7 +480,14 @@ impl PreparedChange {
         Ok(())
     }
     pub fn target_scope_hash(&self) -> Result<String, ChangeError> {
-        digest("target-scope", &self.policy.targets)
+        if self.schema_version == 3 {
+            digest(
+                "gcp-iam-owned-compensation-target-scope",
+                &self.plan.targets,
+            )
+        } else {
+            digest("target-scope", &self.policy.targets)
+        }
     }
     pub fn limits_hash(&self) -> Result<String, ChangeError> {
         self.limits.hash()
@@ -690,9 +743,9 @@ fn target_resource(target: &Target) -> Result<String, ChangeError> {
         &(&target.placement, &target.resource.native_id),
     )
 }
-fn conflict_keys(policy: &PolicyRevision) -> Result<Vec<ConflictKey>, ChangeError> {
+fn conflict_keys(targets: &[Target]) -> Result<Vec<ConflictKey>, ChangeError> {
     let mut keys = BTreeSet::new();
-    for target in &policy.targets {
+    for target in targets {
         keys.insert(ConflictKey {
             resource_identity: target_resource(target)?,
             field_or_domain: "*".into(),
@@ -745,6 +798,7 @@ fn recovery(policy: &PolicyRevision, plan: &ChangePlan) -> Result<RecoveryPlan, 
             let method = match step.action {
                 ActionKind::DisableNewConnections
                 | ActionKind::DisableNativeIdentity
+                | ActionKind::CompensateOwnedIam
                 | ActionKind::RevokeSqlPrivileges => RecoveryMethod::NoAutomaticAllowRestoration,
                 ActionKind::ObserveRevocation => RecoveryMethod::ManualRecovery,
                 ActionKind::TerminateSelectedSessions => RecoveryMethod::NotReversible,
@@ -774,6 +828,9 @@ fn recovery(policy: &PolicyRevision, plan: &ChangePlan) -> Result<RecoveryPlan, 
         .collect();
     let mut routes = BTreeSet::new();
     for grant in &policy.grants {
+        if plan.schema_version == 2 && !plan.steps.iter().any(|step| step.grant_id == grant.id) {
+            continue;
+        }
         let profile = policy
             .protection_profiles
             .iter()

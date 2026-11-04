@@ -97,6 +97,12 @@ pub(crate) fn completed_without_native(
     let mut output = serde_json::json!({"operation_only":true,"native_dispatch_available":false,
         "native_queries_performed":false,"operation":operation,"steps":records,
         "intent_qualification":report,"forward_dispatch_blocked":!report.is_dispatch_qualified()});
+    if records
+        .iter()
+        .any(|step| step.state == StepState::Compensated)
+    {
+        output["owned_iam_delta_removed"] = serde_json::json!(true);
+    }
     for (key, value) in completion(operation.state)
         .as_object()
         .ok_or(GuardError::StorageFailed)?
@@ -115,6 +121,34 @@ pub(crate) fn completed_without_native(
 pub(crate) fn completion(state: ExecutionState) -> serde_json::Value {
     serde_json::json!({"operation_scope_completed":state==ExecutionState::Completed,
         "protection_evaluated":false,"current_protection_rechecked":false})
+}
+
+pub(crate) fn annotate_owned_iam(
+    change: &PreparedChange,
+    records: &[StepRecord],
+    output: &mut serde_json::Value,
+) {
+    if !change.lifecycle.as_ref().is_some_and(|context| {
+        context.kind == crate::core::lifecycle::LifecycleKind::CompensateOwnedIam
+    }) {
+        return;
+    }
+    let removed = records
+        .iter()
+        .any(|step| step.state == StepState::Compensated);
+    let unattributed = change.plan.steps.first().is_some_and(|step| {
+        let marker =
+            crate::adapters::deployment::gcp::owned_iam_unattributed_absence_ref(change, step);
+        records.iter().any(|record| {
+            record.step_id == step.id
+                && record
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.evidence_refs.contains(&marker))
+        })
+    });
+    output["owned_iam_delta_removed"] = serde_json::json!(removed);
+    output["unattributed_iam_absence_recorded"] = serde_json::json!(unattributed);
 }
 
 pub(crate) fn append_report(

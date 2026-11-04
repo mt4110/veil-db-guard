@@ -231,6 +231,7 @@ pub enum CheckpointKind {
     ApplicationCutover,
     ExclusiveNativeChangeWindow,
     NativePreparationReady,
+    OwnedIamCompensationReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,7 +385,20 @@ impl ManualCheckpoint {
         expected_configuration_hash: Option<String>,
     ) -> Result<Self, BindingError> {
         let (target, bindings, recovery) = scope(change, target_id)?;
-        if bindings.is_empty() && kind != CheckpointKind::ExclusiveNativeChangeWindow {
+        if kind == CheckpointKind::OwnedIamCompensationReady
+            && !change.lifecycle.as_ref().is_some_and(|context| {
+                context.kind == crate::core::lifecycle::LifecycleKind::CompensateOwnedIam
+            })
+        {
+            return Err(BindingError::Unsupported);
+        }
+        if bindings.is_empty()
+            && !matches!(
+                kind,
+                CheckpointKind::ExclusiveNativeChangeWindow
+                    | CheckpointKind::OwnedIamCompensationReady
+            )
+        {
             return Err(BindingError::Unsupported);
         }
         if (kind == CheckpointKind::NativePreparationReady) != expected_configuration_hash.is_some()
@@ -397,7 +411,9 @@ impl ManualCheckpoint {
         }
         let max_validity = if matches!(
             kind,
-            CheckpointKind::ExclusiveNativeChangeWindow | CheckpointKind::NativePreparationReady
+            CheckpointKind::ExclusiveNativeChangeWindow
+                | CheckpointKind::NativePreparationReady
+                | CheckpointKind::OwnedIamCompensationReady
         ) {
             3_600
         } else {
@@ -471,6 +487,15 @@ impl ManualCheckpoint {
 }
 
 pub trait CheckpointGate {
+    fn validate_owned_iam_compensation(
+        &self,
+        _change: &PreparedChange,
+        _target_id: &str,
+        _now: u64,
+    ) -> Result<String, BindingError> {
+        Err(BindingError::Pending)
+    }
+
     fn validate_preparation(
         &self,
         _change: &PreparedChange,
@@ -529,6 +554,30 @@ impl ManualCheckpoints {
     }
 }
 impl CheckpointGate for ManualCheckpoints {
+    fn validate_owned_iam_compensation(
+        &self,
+        change: &PreparedChange,
+        target_id: &str,
+        now: u64,
+    ) -> Result<String, BindingError> {
+        if self.receipts.len() > 1024 {
+            return Err(BindingError::Invalid);
+        }
+        let ready = self.receipts.iter().find(|ready| {
+            ready.kind == CheckpointKind::OwnedIamCompensationReady
+                && ready.validate(change, target_id, now).is_ok()
+                && self.receipts.iter().any(|window| {
+                    window.kind == CheckpointKind::ExclusiveNativeChangeWindow
+                        && window.attested_by == ready.attested_by
+                        && window.attested_at <= ready.attested_at
+                        && window.validate(change, target_id, now).is_ok()
+                })
+        });
+        ready
+            .map(|r| r.checkpoint_hash.clone())
+            .ok_or(BindingError::Pending)
+    }
+
     fn validate_preparation(
         &self,
         change: &PreparedChange,

@@ -18,6 +18,7 @@ use crate::{
         change::PreparedChange,
         operation::{DispatchTicket, EffectState, StepReceipt, StepRecord, StepState},
         orchestrator::{ExecutorError, StepExecutor},
+        owned_iam::{OwnedIamBinding, OwnedIamDeltaReceipt, numeric_id, valid_etag},
         plan::PlanStep,
         policy::{
             AdmissionIntent, EngineFamily, Grant, GrantLifetime, IdentityProvider, ManagedField,
@@ -37,10 +38,14 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+mod owned_iam;
+use owned_iam::{IamPolicy, PolicySnapshot, binding_value, has_title};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderError {
     Unavailable,
     Precondition,
+    Conflict,
     NotApplied,
     Unknown,
 }
@@ -49,6 +54,7 @@ impl From<ProviderError> for ExecutorError {
         match value {
             ProviderError::Unavailable => Self::Unavailable,
             ProviderError::Precondition => Self::PreconditionsNotMet,
+            ProviderError::Conflict => Self::NotApplied,
             ProviderError::NotApplied => Self::NotApplied,
             ProviderError::Unknown => Self::OutcomeUnknown,
         }
@@ -143,6 +149,8 @@ pub fn classify_transport_refusal(kind: std::io::ErrorKind) -> bool {
     kind == std::io::ErrorKind::ConnectionRefused
 }
 
+type BeforeIamSend<'a> = dyn FnMut(&dyn Fn() -> u64) -> Result<(), ProviderError> + 'a;
+
 /// An injected provider is trusted adapter implementation code. All mutations
 /// must condition on the supplied version, preserve unrelated fields and never
 /// retry after an ambiguous response. Tests implement this port without network.
@@ -156,8 +164,34 @@ pub trait CloudSqlProvider {
     fn execution_identity(&mut self) -> Result<String, ProviderError>;
     fn instance(&mut self, target: &Target) -> Result<CloudSqlInstance, ProviderError>;
     fn service_account_id(&mut self, email: &str) -> Result<String, ProviderError>;
+    fn project_number(&mut self, _project: &str) -> Result<String, ProviderError> {
+        Err(ProviderError::Unavailable)
+    }
     fn iam_policy(&mut self, project: &str) -> Result<Value, ProviderError>;
+    fn iam_policy_with_version(&mut self, project: &str) -> Result<Value, ProviderError> {
+        self.iam_policy(project)
+    }
     fn set_iam_policy(&mut self, project: &str, policy: &Value) -> Result<(), ProviderError>;
+    fn set_iam_policy_receipt(
+        &mut self,
+        project: &str,
+        policy: &Value,
+    ) -> Result<Option<Value>, ProviderError> {
+        self.set_iam_policy(project, policy)?;
+        Ok(None)
+    }
+    fn set_iam_policy_receipt_checked(
+        &mut self,
+        project: &str,
+        policy: &Value,
+        before_send: &mut BeforeIamSend<'_>,
+    ) -> Result<Option<Value>, ProviderError> {
+        before_send(&|| self.now())?;
+        if self.cancelled() {
+            return Err(ProviderError::NotApplied);
+        }
+        self.set_iam_policy_receipt(project, policy)
+    }
     fn users(&mut self, target: &Target) -> Result<Vec<CloudSqlUser>, ProviderError>;
     fn patch(
         &mut self,
@@ -235,6 +269,7 @@ pub struct GcpExecutor<P, G> {
     execution_identity: String,
     checkpoints: G,
     last_revocation: Option<RevocationEvidence>,
+    last_owned_iam_delta: Option<OwnedIamDeltaReceipt>,
     source_contract_scope: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -259,9 +294,10 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
         step: &PlanStep,
         ticket: &DispatchTicket,
         gate: &mut dyn crate::core::source_execution::SourceStepGate,
+        dispatch_check: &mut dyn FnMut() -> Result<(), ExecutorError>,
     ) -> Result<StepReceipt, ExecutorError> {
         self.with_source_contract(|this| {
-            this.submit_checked(change, step, ticket, &mut || {
+            let mut source_check = || {
                 gate.validate_sources(change)
                     .map_err(|_| ExecutorError::NotApplied)?;
                 if matches!(
@@ -269,6 +305,7 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
                     ActionKind::ConstrainDirectPath
                         | ActionKind::DisableNativeIdentity
                         | ActionKind::ObserveRevocation
+                        | ActionKind::CompensateOwnedIam
                 ) {
                     let proof = gate
                         .check(
@@ -282,7 +319,8 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
                     }
                 }
                 Ok(())
-            })
+            };
+            this.submit_checked(change, step, ticket, &mut source_check, dispatch_check)
         })
     }
     fn check_before_write(
@@ -311,13 +349,24 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
         step: &PlanStep,
         ticket: &DispatchTicket,
         before_write: &mut dyn FnMut() -> Result<(), ExecutorError>,
+        dispatch_check: &mut dyn FnMut() -> Result<(), ExecutorError>,
     ) -> Result<StepReceipt, ExecutorError> {
+        self.last_owned_iam_delta = None;
         if ticket.step_id != step.id
             || ticket.idempotency_key.is_empty()
             || ticket.attempt == 0
             || self.cancelled()
         {
             return Err(ExecutorError::PreconditionsNotMet);
+        }
+        if step.action == ActionKind::CompensateOwnedIam {
+            return self.submit_owned_compensation(
+                change,
+                step,
+                ticket,
+                before_write,
+                dispatch_check,
+            );
         }
         // Repeat all checks immediately before mutation; preflight is not a
         // reusable authorization or generation assertion.
@@ -377,13 +426,18 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
             .validate_change_window(change, &target.id, self.provider.now())
             .map_err(|_| ExecutorError::NotApplied)?;
         let native = match step.action {
-            ActionKind::ConfigureIdentity | ActionKind::DisableNativeIdentity => {
+            ActionKind::ConfigureIdentity => {
+                return self.configure_identity(
+                    change,
+                    step,
+                    ticket,
+                    before_write,
+                    (target, grant, subject, &instance),
+                );
+            }
+            ActionKind::DisableNativeIdentity => {
                 let before = self.provider.iam_policy(&target.placement.account_id)?;
-                let desired = if step.action == ActionKind::DisableNativeIdentity {
-                    removed_iam_policy(change, target, grant, subject, &before)?
-                } else {
-                    desired_iam_policy(change, target, grant, subject, &before)?
-                };
+                let desired = removed_iam_policy(change, target, grant, subject, &before)?;
                 self.checkpoints
                     .validate_change_window(change, &target.id, self.provider.now())
                     .map_err(|_| ExecutorError::NotApplied)?;
@@ -429,12 +483,331 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
             evidence_refs: vec![],
         })
     }
+    fn configure_identity(
+        &mut self,
+        change: &PreparedChange,
+        step: &PlanStep,
+        ticket: &DispatchTicket,
+        before_write: &mut dyn FnMut() -> Result<(), ExecutorError>,
+        (target, grant, subject, instance): (&Target, &Grant, &Subject, &CloudSqlInstance),
+    ) -> Result<StepReceipt, ExecutorError> {
+        let project = &target.placement.account_id;
+        let (before, snapshot) = match self.provider.iam_policy_with_version(project) {
+            Ok(raw) => {
+                let snapshot = PolicySnapshot::parse(&raw).ok();
+                (raw, snapshot)
+            }
+            Err(_) => (self.provider.iam_policy(project)?, None),
+        };
+        let before_read_at = self.provider.now();
+        let desired = desired_iam_policy(change, target, grant, subject, &before)?;
+        if desired == before {
+            return self.applied(change, step, target, synchronous_ref(change, step), true);
+        }
+        let bindings = OwnedIamBinding::for_grant(&change.policy.policy_id, target, grant, subject);
+        let owned_candidate = snapshot
+            .zip(PolicySnapshot::parse(&desired).ok())
+            .filter(|_| {
+                change.lifecycle.is_none()
+                    && change.policy.schema_version == 2
+                    && bindings
+                        .iter()
+                        .all(|binding| !has_title(&before, &binding.condition.title))
+            })
+            .and_then(|(before, desired)| {
+                self.provider
+                    .project_number(project)
+                    .ok()
+                    .filter(|number| numeric_id(number))
+                    .map(|number| (before, desired, number))
+            });
+        self.check_before_write(change, step, before_write)?;
+        if let Some((_, _, number)) = &owned_candidate {
+            self.revalidate_iam_scope(target, subject, number)
+                .map_err(|_| ExecutorError::NotApplied)?;
+            // The late incarnation reads can take time. Recheck the write
+            // window and cancellation before sending the same CAS etag.
+            self.check_before_write(change, step, &mut || Ok(()))?;
+        }
+        let response = self.provider.set_iam_policy_receipt(project, &desired)?;
+        let owned_after = owned_candidate
+            .zip(
+                response
+                    .as_ref()
+                    .and_then(|r| PolicySnapshot::parse(r).ok()),
+            )
+            .and_then(|((before, expected, number), response)| {
+                if response.etag == before.etag || response.digest != expected.digest {
+                    return None;
+                }
+                let raw = self.provider.iam_policy_with_version(project).ok()?;
+                let after = PolicySnapshot::parse(&raw).ok()?;
+                let after_read_at = self.provider.now();
+                if after.etag != response.etag
+                    || after.digest != response.digest
+                    || self.revalidate_iam_scope(target, subject, &number).is_err()
+                {
+                    return None;
+                }
+                Some((before, number, after, after_read_at))
+            });
+        if owned_after.is_none()
+            && !self.configured(change, step, target, grant, subject, instance)?
+        {
+            return Err(ExecutorError::OutcomeUnknown);
+        }
+        let receipt = self.applied(change, step, target, synchronous_ref(change, step), false)?;
+        if let Some((before, project_number, after, after_read_at)) = owned_after {
+            let delta = OwnedIamDeltaReceipt {
+                source_operation_id: ticket.operation_id.clone(),
+                source_change_hash: change.change_hash.clone(),
+                source_policy_revision_hash: change.plan.policy_revision_hash.clone(),
+                source_step_id: step.id.clone(),
+                attempt: ticket.attempt,
+                idempotency_key: ticket.idempotency_key.clone(),
+                execution_identity: self.execution_identity.clone(),
+                step_receipt_hash: OwnedIamDeltaReceipt::step_receipt_hash(&receipt),
+                project_id: project.clone(),
+                project_number,
+                native_resource_id: target.resource.native_id.clone(),
+                registration_id: target.registration_id.clone(),
+                generation_fingerprint: target
+                    .resource
+                    .generation_fingerprint
+                    .clone()
+                    .unwrap_or_default(),
+                engine_version: target.engine.version.clone(),
+                grant_id: grant.id.clone(),
+                service_account_email: subject.identity.principal.clone(),
+                service_account_unique_id: subject
+                    .identity
+                    .immutable_id
+                    .clone()
+                    .unwrap_or_default(),
+                db_login: grant.db_identity.clone(),
+                before_etag: before.etag,
+                before_digest: before.digest,
+                before_read_at,
+                after_etag: after.etag,
+                after_digest: after.digest,
+                after_read_at,
+                bindings,
+            };
+            self.last_owned_iam_delta = delta.matches_change(change).then_some(delta);
+        }
+        Ok(receipt)
+    }
+    fn revalidate_iam_scope(
+        &mut self,
+        target: &Target,
+        subject: &Subject,
+        project_number: &str,
+    ) -> Result<(), ExecutorError> {
+        if self.provider.project_number(&target.placement.account_id)? != project_number
+            || Some(
+                self.provider
+                    .service_account_id(&subject.identity.principal)?,
+            ) != subject.identity.immutable_id
+        {
+            return Err(ExecutorError::PreconditionsNotMet);
+        }
+        let instance = self.provider.instance(target)?;
+        self.check_instance(target, &instance)
+    }
+    fn owned_compensation_context<'a>(
+        &mut self,
+        change: &'a PreparedChange,
+        step: &PlanStep,
+        mode: ContextMode,
+    ) -> Result<(&'a Target, &'a Subject, &'a OwnedIamDeltaReceipt), ExecutorError> {
+        let (target, grant, subject, _) = self.context(change, step, mode)?;
+        let owned = change
+            .lifecycle
+            .as_ref()
+            .filter(|context| {
+                context.kind == crate::core::lifecycle::LifecycleKind::CompensateOwnedIam
+            })
+            .and_then(|context| context.owned_iam.as_ref())
+            .filter(|owned| {
+                owned.validate()
+                    && owned.matches_scope(&change.policy.policy_id, target, grant, subject)
+            })
+            .ok_or(ExecutorError::PreconditionsNotMet)?;
+        Ok((target, subject, owned))
+    }
+    fn owned_compensation_candidate(
+        &mut self,
+        owned: &OwnedIamDeltaReceipt,
+    ) -> Result<(Value, PolicySnapshot), ExecutorError> {
+        let mut policy = self.provider.iam_policy_with_version(&owned.project_id)?;
+        let current = PolicySnapshot::parse(&policy)?;
+        if current.etag != owned.after_etag || current.digest != owned.after_digest {
+            return Err(ExecutorError::PreconditionsNotMet);
+        }
+        let rows = policy
+            .get_mut("bindings")
+            .and_then(Value::as_array_mut)
+            .ok_or(ExecutorError::PreconditionsNotMet)?;
+        for binding in &owned.bindings {
+            let exact = binding_value(binding);
+            let position = rows
+                .iter()
+                .position(|row| *row == exact)
+                .ok_or(ExecutorError::PreconditionsNotMet)?;
+            rows.remove(position);
+        }
+        policy["version"] = json!(3);
+        let expected = PolicySnapshot::parse(&policy)?;
+        if expected.digest != owned.before_digest {
+            return Err(ExecutorError::PreconditionsNotMet);
+        }
+        Ok((policy, expected))
+    }
+    fn submit_owned_compensation(
+        &mut self,
+        change: &PreparedChange,
+        step: &PlanStep,
+        ticket: &DispatchTicket,
+        before_write: &mut dyn FnMut() -> Result<(), ExecutorError>,
+        dispatch_check: &mut dyn FnMut() -> Result<(), ExecutorError>,
+    ) -> Result<StepReceipt, ExecutorError> {
+        let (target, subject, owned) = self
+            .owned_compensation_context(change, step, ContextMode::Dispatch)
+            .map_err(|_| ExecutorError::NotApplied)?;
+        let (policy, expected) = self.owned_compensation_candidate(owned)?;
+        self.revalidate_iam_scope(target, subject, &owned.project_number)
+            .map_err(|_| ExecutorError::NotApplied)?;
+        let now = self.provider.now();
+        if now >= ticket.leases.expires_at {
+            return Err(ExecutorError::NotApplied);
+        }
+        self.checkpoints
+            .validate_owned_iam_compensation(change, &target.id, now)
+            .map_err(|_| ExecutorError::NotApplied)?;
+        let mut readiness_ref = None;
+        let response = match self.provider.set_iam_policy_receipt_checked(
+            &owned.project_id,
+            &policy,
+            &mut |now| {
+                before_write().map_err(|_| ProviderError::NotApplied)?;
+                let now = now();
+                if now >= ticket.leases.expires_at {
+                    return Err(ProviderError::NotApplied);
+                }
+                readiness_ref = Some(
+                    self.checkpoints
+                        .validate_owned_iam_compensation(change, &target.id, now)
+                        .map_err(|_| ProviderError::NotApplied)?,
+                );
+                dispatch_check().map_err(|_| ProviderError::NotApplied)
+            },
+        ) {
+            Ok(Some(response)) => response,
+            Ok(None) => return Err(ExecutorError::OutcomeUnknown),
+            Err(ProviderError::Conflict) => {
+                return Ok(StepReceipt {
+                    state: StepState::Failed,
+                    effect: EffectState::Unknown,
+                    native_operation_ref: None,
+                    evidence_refs: vec![],
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let applied =
+            PolicySnapshot::parse(&response).map_err(|_| ExecutorError::OutcomeUnknown)?;
+        if applied.etag == owned.after_etag
+            || applied.etag == owned.before_etag
+            || applied.digest != expected.digest
+        {
+            return Err(ExecutorError::OutcomeUnknown);
+        }
+        // Persist the provider's success before attempting any readback.
+        Ok(StepReceipt {
+            state: StepState::ConfigApplied,
+            effect: EffectState::Unknown,
+            native_operation_ref: Some(format!(
+                "gcp-owned-iam-removal-v1.{}.{}",
+                applied.etag, applied.digest
+            )),
+            evidence_refs: vec![readiness_ref.ok_or(ExecutorError::OutcomeUnknown)?],
+        })
+    }
+    fn query_owned_compensation(
+        &mut self,
+        change: &PreparedChange,
+        step: &PlanStep,
+        record: &StepRecord,
+    ) -> Result<StepReceipt, ExecutorError> {
+        let (target, subject, owned) =
+            self.owned_compensation_context(change, step, ContextMode::Reconcile)?;
+        let policy = self.provider.iam_policy_with_version(&owned.project_id)?;
+        let current = PolicySnapshot::parse(&policy)?;
+        self.revalidate_iam_scope(target, subject, &owned.project_number)?;
+        let absent = owned
+            .bindings
+            .iter()
+            .all(|binding| !has_title(&policy, &binding.condition.title));
+        let reference = record
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.native_operation_ref.as_deref());
+        if let Some(reference) = reference {
+            let (etag, digest) = reference
+                .strip_prefix("gcp-owned-iam-removal-v1.")
+                .and_then(|value| value.split_once('.'))
+                .filter(|(etag, digest)| valid_etag(etag) && *digest == owned.before_digest)
+                .ok_or(ExecutorError::OutcomeUnknown)?;
+            if absent && current.etag == etag && current.digest == digest {
+                let mut evidence_refs = record
+                    .receipt
+                    .as_ref()
+                    .map(|receipt| receipt.evidence_refs.clone())
+                    .unwrap_or_default();
+                evidence_refs.push(hash_bytes(
+                    &serde_json::to_vec(&(
+                        "gcp-owned-iam-readback-v1",
+                        &change.change_hash,
+                        reference,
+                    ))
+                    .expect("fixed tuple serializes"),
+                ));
+                return Ok(StepReceipt {
+                    state: StepState::Compensated,
+                    effect: EffectState::Unknown,
+                    native_operation_ref: Some(reference.into()),
+                    evidence_refs,
+                });
+            }
+        } else if absent {
+            let absence_ref = hash_bytes(
+                &serde_json::to_vec(&(
+                    "gcp-owned-iam-unattributed-absence-v1",
+                    &change.change_hash,
+                    &current.etag,
+                    &current.digest,
+                ))
+                .expect("fixed tuple serializes"),
+            );
+            return Ok(StepReceipt {
+                state: StepState::OutcomeUnknown,
+                effect: EffectState::Unknown,
+                native_operation_ref: None,
+                evidence_refs: vec![
+                    owned_iam_unattributed_absence_ref(change, step),
+                    absence_ref,
+                ],
+            });
+        }
+        Err(ExecutorError::OutcomeUnknown)
+    }
     pub fn new(provider: P, execution_identity: String, checkpoints: G) -> Self {
         Self {
             provider,
             execution_identity,
             checkpoints,
             last_revocation: None,
+            last_owned_iam_delta: None,
             source_contract_scope: false,
         }
     }
@@ -580,6 +953,7 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
                 && !matches!(
                     step.action,
                     ActionKind::DisableNativeIdentity
+                        | ActionKind::CompensateOwnedIam
                         | ActionKind::ObserveRevocation
                         | ActionKind::DisableNewConnections
                         | ActionKind::RevokeSqlPrivileges
@@ -605,6 +979,7 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
             && !matches!(
                 step.action,
                 ActionKind::DisableNativeIdentity
+                    | ActionKind::CompensateOwnedIam
                     | ActionKind::ObserveRevocation
                     | ActionKind::DisableNewConnections
                     | ActionKind::RevokeSqlPrivileges
@@ -646,9 +1021,9 @@ impl<P: CloudSqlProvider, G: CheckpointGate> GcpExecutor<P, G> {
         let fields = &target.managed_surface.fields;
         let owned = match step.action {
             ActionKind::PrepareNativeRoute => fields.contains(&ManagedField::GcpDatabaseFlag),
-            ActionKind::ConfigureIdentity | ActionKind::DisableNativeIdentity => {
-                fields.contains(&ManagedField::GcpIamBinding)
-            }
+            ActionKind::ConfigureIdentity
+            | ActionKind::DisableNativeIdentity
+            | ActionKind::CompensateOwnedIam => fields.contains(&ManagedField::GcpIamBinding),
             ActionKind::ObserveRevocation => {
                 fields.contains(&ManagedField::GcpIamBinding)
                     && fields.contains(&ManagedField::GcpConnectorEnforcement)
@@ -917,10 +1292,21 @@ impl<P: CloudSqlProvider, G: CheckpointGate> StepExecutor for GcpExecutor<P, G> 
                 | ActionKind::RegisterNativeDbIdentity
                 | ActionKind::ConstrainDirectPath
                 | ActionKind::DisableNativeIdentity
+                | ActionKind::CompensateOwnedIam
                 | ActionKind::ObserveRevocation
         )
     }
     fn preflight(&mut self, change: &PreparedChange, step: &PlanStep) -> Result<(), ExecutorError> {
+        if step.action == ActionKind::CompensateOwnedIam {
+            let (target, subject, owned) =
+                self.owned_compensation_context(change, step, ContextMode::Dispatch)?;
+            self.checkpoints
+                .validate_owned_iam_compensation(change, &target.id, self.provider.now())
+                .map_err(|_| ExecutorError::PreconditionsNotMet)?;
+            self.revalidate_iam_scope(target, subject, &owned.project_number)?;
+            self.owned_compensation_candidate(owned)?;
+            return Ok(());
+        }
         let (target, grant, subject, instance) =
             self.context(change, step, ContextMode::Dispatch)?;
         // Read the exact write domain before durable dispatch, detecting invalid
@@ -957,7 +1343,13 @@ impl<P: CloudSqlProvider, G: CheckpointGate> StepExecutor for GcpExecutor<P, G> 
         step: &PlanStep,
         ticket: &DispatchTicket,
     ) -> Result<StepReceipt, ExecutorError> {
-        self.submit_checked(change, step, ticket, &mut || Ok(()))
+        if step.action == ActionKind::CompensateOwnedIam {
+            return Err(ExecutorError::Unavailable);
+        }
+        self.submit_checked(change, step, ticket, &mut || Ok(()), &mut || Ok(()))
+    }
+    fn take_gcp_iam_owned_delta(&mut self) -> Option<OwnedIamDeltaReceipt> {
+        self.last_owned_iam_delta.take()
     }
     fn query(
         &mut self,
@@ -967,6 +1359,9 @@ impl<P: CloudSqlProvider, G: CheckpointGate> StepExecutor for GcpExecutor<P, G> 
     ) -> Result<StepReceipt, ExecutorError> {
         if record.step_id != step.id {
             return Err(ExecutorError::PreconditionsNotMet);
+        }
+        if step.action == ActionKind::CompensateOwnedIam {
+            return self.query_owned_compensation(change, step, record);
         }
         let reference = record
             .receipt
@@ -1016,6 +1411,19 @@ fn synchronous_ref(change: &PreparedChange, step: &PlanStep) -> String {
             &serde_json::to_vec(&(&change.change_hash, &step.id, &step.parameters_hash))
                 .expect("fixed tuple serializes")
         )
+    )
+}
+
+/// Marker for a historical, read-only absence observation with no attributable
+/// removal response. The companion evidence digest commits to the snapshot.
+pub fn owned_iam_unattributed_absence_ref(change: &PreparedChange, step: &PlanStep) -> String {
+    hash_bytes(
+        &serde_json::to_vec(&(
+            "gcp-owned-iam-unattributed-absence-marker-v1",
+            &change.change_hash,
+            &step.id,
+        ))
+        .expect("fixed tuple serializes"),
     )
 }
 fn validate_operation(target: &Target, native: &NativeOperation) -> Result<(), ExecutorError> {
@@ -1077,27 +1485,14 @@ fn owned_iam_policy(
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or(ProviderError::Precondition)?;
-    let ownership = hash_bytes(
-        &serde_json::to_vec(&(
-            &change.policy.policy_id,
-            &target.registration_id,
-            &target.resource.generation_fingerprint,
-            &grant.id,
-            &subject.identity.immutable_id,
-        ))
-        .map_err(|_| ProviderError::Precondition)?,
-    );
-    for (suffix, role) in [
-        ("connect", "roles/cloudsql.client"),
-        ("login", "roles/cloudsql.instanceUser"),
-    ] {
-        let title = format!("veil-db-guard-{}-{suffix}", &ownership[..32]);
-        let desired = json!({"role":role,"members":[format!("serviceAccount:{}", subject.identity.principal)],
-            "condition":{"title":title,"description":"Veil-owned instance-scoped allow; no broad role replacement",
-                "expression":format!("resource.name == '{}' && resource.type == 'sqladmin.googleapis.com/Instance'", target.resource.native_id)}});
+    for binding in OwnedIamBinding::for_grant(&change.policy.policy_id, target, grant, subject) {
+        let desired = binding_value(&binding);
         let existing = bindings
             .iter()
-            .filter(|b| b.pointer("/condition/title").and_then(Value::as_str) == Some(&title))
+            .filter(|b| {
+                b.pointer("/condition/title").and_then(Value::as_str)
+                    == Some(&binding.condition.title)
+            })
             .collect::<Vec<_>>();
         if existing.len() > 1 || existing.first().is_some_and(|b| **b != desired) {
             return Err(ProviderError::Precondition);
@@ -1110,7 +1505,12 @@ fn owned_iam_policy(
     }
     // IAM conditions require version 3. Existing version 3 must be requested on
     // read or a conditional policy could be silently collapsed to hashed roles.
-    if object.get("version").and_then(Value::as_u64) != Some(3) {
+    if object.get("version").and_then(Value::as_u64) == Some(1)
+        && !remove
+        && PolicySnapshot::parse(before).is_ok()
+    {
+        object.insert("version".into(), json!(3));
+    } else if object.get("version").and_then(Value::as_u64) != Some(3) {
         return Err(ProviderError::Precondition);
     }
     Ok(next)
@@ -1305,6 +1705,34 @@ impl GcloudProvider {
         body: Option<&Value>,
         mutation: bool,
     ) -> Result<Value, ProviderError> {
+        let output = self.rest_bytes(host, method, path, body, mutation)?;
+        serde_json::from_slice(&output).map_err(|_| {
+            if mutation {
+                ProviderError::Unknown
+            } else {
+                ProviderError::Unavailable
+            }
+        })
+    }
+    fn rest_bytes(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        mutation: bool,
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.rest_bytes_checked(host, method, path, body, mutation, &mut |_| Ok(()))
+    }
+    fn rest_bytes_checked(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        mutation: bool,
+        before_send: &mut BeforeIamSend<'_>,
+    ) -> Result<Vec<u8>, ProviderError> {
         if ![
             "sqladmin.googleapis.com",
             "cloudresourcemanager.googleapis.com",
@@ -1347,6 +1775,14 @@ impl GcloudProvider {
         .iter()
         .map(|v| (*v).into())
         .collect();
+        before_send(&|| self.now())?;
+        if self.cancelled() {
+            return Err(if mutation {
+                ProviderError::NotApplied
+            } else {
+                ProviderError::Unavailable
+            });
+        }
         let output =
             run_process(&self.curl, &args, config.as_bytes(), &self.cancel).map_err(|_| {
                 if mutation {
@@ -1364,21 +1800,55 @@ impl GcloudProvider {
             .and_then(|v| v.parse::<u16>().ok())
             .ok_or(ProviderError::Unknown)?;
         if !(200..300).contains(&status) {
-            return Err(if matches!(status, 400 | 401 | 403 | 404 | 409 | 412) {
-                ProviderError::NotApplied
-            } else if mutation {
-                ProviderError::Unknown
-            } else {
-                ProviderError::Unavailable
-            });
+            return Err(
+                if mutation && path.ends_with(":setIamPolicy") && matches!(status, 409 | 412) {
+                    ProviderError::Conflict
+                } else if matches!(status, 400 | 401 | 403 | 404 | 409 | 412) {
+                    ProviderError::NotApplied
+                } else if mutation {
+                    ProviderError::Unknown
+                } else {
+                    ProviderError::Unavailable
+                },
+            );
         }
-        serde_json::from_slice(&output[..split]).map_err(|_| {
-            if mutation {
-                ProviderError::Unknown
-            } else {
-                ProviderError::Unavailable
-            }
-        })
+        Ok(output[..split].to_vec())
+    }
+    fn read_iam_policy_bytes(&self, project: &str) -> Result<Vec<u8>, ProviderError> {
+        if !segment(project) {
+            return Err(ProviderError::Precondition);
+        }
+        self.rest_bytes(
+            "cloudresourcemanager.googleapis.com",
+            "POST",
+            &format!("/v1/projects/{project}:getIamPolicy"),
+            Some(&json!({"options":{"requestedPolicyVersion":3}})),
+            false,
+        )
+    }
+    fn write_iam_policy_bytes(
+        &self,
+        project: &str,
+        policy: &Value,
+        before_send: &mut BeforeIamSend<'_>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        if !segment(project)
+            || policy
+                .get("etag")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || policy.get("version") != Some(&json!(3))
+        {
+            return Err(ProviderError::Precondition);
+        }
+        self.rest_bytes_checked(
+            "cloudresourcemanager.googleapis.com",
+            "POST",
+            &format!("/v1/projects/{project}:setIamPolicy"),
+            Some(&json!({"policy":policy,"updateMask":"bindings,etag,version"})),
+            true,
+            before_send,
+        )
     }
     fn instance_path(target: &Target) -> Result<String, ProviderError> {
         Ok(format!(
@@ -1467,6 +1937,26 @@ impl CloudSqlProvider for GcloudProvider {
         }
         string(&value, "/uniqueId")
     }
+    fn project_number(&mut self, project: &str) -> Result<String, ProviderError> {
+        if !segment(project) {
+            return Err(ProviderError::Precondition);
+        }
+        let value = self.rest(
+            "cloudresourcemanager.googleapis.com",
+            "GET",
+            &format!("/v1/projects/{project}"),
+            None,
+            false,
+        )?;
+        let number = string(&value, "/projectNumber")?;
+        if string(&value, "/projectId")? != project
+            || string(&value, "/lifecycleState")? != "ACTIVE"
+            || !numeric_id(&number)
+        {
+            return Err(ProviderError::Precondition);
+        }
+        Ok(number)
+    }
     fn instance(&mut self, target: &Target) -> Result<CloudSqlInstance, ProviderError> {
         let value = self.rest(
             "sqladmin.googleapis.com",
@@ -1496,16 +1986,9 @@ impl CloudSqlProvider for GcloudProvider {
         })
     }
     fn iam_policy(&mut self, project: &str) -> Result<Value, ProviderError> {
-        if !segment(project) {
-            return Err(ProviderError::Precondition);
-        }
-        let mut value = self.rest(
-            "cloudresourcemanager.googleapis.com",
-            "POST",
-            &format!("/v1/projects/{project}:getIamPolicy"),
-            Some(&json!({"options":{"requestedPolicyVersion":3}})),
-            false,
-        )?;
+        let bytes = self.read_iam_policy_bytes(project)?;
+        let mut value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| ProviderError::Unavailable)?;
         // An unconditional policy can legitimately be returned with version 1.
         // Request version 3 and promote only after ensuring native bindings have
         // no synthetic condition-hash roles from an older version-1 read.
@@ -1528,24 +2011,35 @@ impl CloudSqlProvider for GcloudProvider {
             .insert("version".into(), json!(3));
         Ok(value)
     }
+    fn iam_policy_with_version(&mut self, project: &str) -> Result<Value, ProviderError> {
+        let bytes = self.read_iam_policy_bytes(project)?;
+        // Validate the wire representation before converting it to a JSON
+        // Value, which would otherwise hide duplicate object keys.
+        serde_json::from_slice::<IamPolicy>(&bytes).map_err(|_| ProviderError::Precondition)?;
+        serde_json::from_slice(&bytes).map_err(|_| ProviderError::Precondition)
+    }
     fn set_iam_policy(&mut self, project: &str, policy: &Value) -> Result<(), ProviderError> {
-        if !segment(project)
-            || policy
-                .get("etag")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            || policy.get("version") != Some(&json!(3))
-        {
-            return Err(ProviderError::Precondition);
-        }
-        self.rest(
-            "cloudresourcemanager.googleapis.com",
-            "POST",
-            &format!("/v1/projects/{project}:setIamPolicy"),
-            Some(&json!({"policy":policy,"updateMask":"bindings,etag,version"})),
-            true,
-        )?;
+        self.set_iam_policy_receipt(project, policy)?;
         Ok(())
+    }
+    fn set_iam_policy_receipt(
+        &mut self,
+        project: &str,
+        policy: &Value,
+    ) -> Result<Option<Value>, ProviderError> {
+        self.set_iam_policy_receipt_checked(project, policy, &mut |_| Ok(()))
+    }
+    fn set_iam_policy_receipt_checked(
+        &mut self,
+        project: &str,
+        policy: &Value,
+        before_send: &mut BeforeIamSend<'_>,
+    ) -> Result<Option<Value>, ProviderError> {
+        let bytes = self.write_iam_policy_bytes(project, policy, before_send)?;
+        let response = serde_json::from_slice(&bytes).map_err(|_| ProviderError::Unknown)?;
+        Ok(serde_json::from_slice::<IamPolicy>(&bytes)
+            .ok()
+            .map(|_| response))
     }
     fn users(&mut self, target: &Target) -> Result<Vec<CloudSqlUser>, ProviderError> {
         let value = self.rest(

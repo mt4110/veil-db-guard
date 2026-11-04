@@ -40,6 +40,24 @@ pub trait StepExecutor {
         step: &PlanStep,
         ticket: &DispatchTicket,
     ) -> Result<StepReceipt, ExecutorError>;
+    /// The compensation adapter calls the ledger check immediately before its
+    /// conditional native write, after its final provider reads.
+    fn submit_with_dispatch_check(
+        &mut self,
+        change: &PreparedChange,
+        step: &PlanStep,
+        ticket: &DispatchTicket,
+        _check: &mut dyn FnMut() -> Result<(), ExecutorError>,
+    ) -> Result<StepReceipt, ExecutorError> {
+        if step.action == super::capability::ActionKind::CompensateOwnedIam {
+            return Err(ExecutorError::NotApplied);
+        }
+        self.submit(change, step, ticket)
+    }
+    /// A typed ownership record from the immediately preceding successful submit.
+    fn take_gcp_iam_owned_delta(&mut self) -> Option<super::owned_iam::OwnedIamDeltaReceipt> {
+        None
+    }
     fn query(
         &mut self,
         change: &PreparedChange,
@@ -152,6 +170,10 @@ pub fn resume_with_clock(
     }
     let change = store.load_change(&operation.change_hash)?;
     change.verify().map_err(|_| StoreError::Invalid)?;
+    let compensation = change
+        .lifecycle
+        .as_ref()
+        .is_some_and(|context| context.kind == super::lifecycle::LifecycleKind::CompensateOwnedIam);
     let stopped = matches!(
         operation.state,
         ExecutionState::Cancelled | ExecutionState::FailedPartial | ExecutionState::Recovering
@@ -180,6 +202,7 @@ pub fn resume_with_clock(
             leases = store.renew_leases(&leases, clock.now(), lease_duration)?;
             let receipt = match executor.query(&change, step, &record) {
                 Ok(receipt) => receipt,
+                Err(_) if compensation && record.state == StepState::ConfigApplied => continue,
                 Err(_) => {
                     let mut receipt = unknown_receipt();
                     receipt.native_operation_ref = record
@@ -207,6 +230,19 @@ pub fn resume_with_clock(
         if stopped {
             return Ok(operation);
         }
+        if compensation
+            && store
+                .steps(operation_id)?
+                .iter()
+                .all(|r| r.state == StepState::Compensated)
+        {
+            return store.set_state(
+                operation_id,
+                operation.version,
+                ExecutionState::Completed,
+                clock.now(),
+            );
+        }
         if clock.now().saturating_sub(operation.created_at) >= change.limits.max_operation_seconds
             && store
                 .steps(operation_id)?
@@ -220,7 +256,7 @@ pub fn resume_with_clock(
                 clock.now(),
             );
         }
-        if !change.plan.required_effect_gaps.is_empty() {
+        if !compensation && !change.plan.required_effect_gaps.is_empty() {
             return store.set_state(
                 operation_id,
                 operation.version,
@@ -318,7 +354,19 @@ pub fn resume_with_clock(
                     executor.identity(),
                     clock.now(),
                 )?;
-                let receipt = match executor.submit(&change, step, &ticket) {
+                let submitted = if compensation {
+                    let identity = executor.identity().to_owned();
+                    executor.submit_with_dispatch_check(&change, step, &ticket, &mut || {
+                        store
+                            .validate_owned_iam_dispatch(&ticket, &identity, clock.now())
+                            .map_err(|_| ExecutorError::NotApplied)
+                    })
+                } else {
+                    executor.submit(&change, step, &ticket)
+                };
+                let successful_submit = submitted.is_ok();
+                let owned_delta = executor.take_gcp_iam_owned_delta();
+                let receipt = match submitted {
                     Ok(receipt) => receipt,
                     Err(ExecutorError::NotApplied) => StepReceipt {
                         state: StepState::NotApplied,
@@ -328,7 +376,12 @@ pub fn resume_with_clock(
                     },
                     Err(_) => unknown_receipt(),
                 };
-                operation = store.record_receipt(&ticket, &receipt, clock.now())?;
+                operation = match owned_delta {
+                    Some(delta) if successful_submit => {
+                        store.record_owned_iam_receipt(&ticket, &receipt, &delta, clock.now())?
+                    }
+                    _ => store.record_receipt(&ticket, &receipt, clock.now())?,
+                };
                 progressed = true;
                 if !satisfied(receipt.state) {
                     let state = match receipt.state {

@@ -483,6 +483,7 @@ pub fn execute(args: NativeGcpArgs, cancel: CancellationToken) -> Result<i32, Gu
 
     let mut output = serde_json::json!({"operation_only":false,"native_dispatch_available":intent_qualification.is_dispatch_qualified(),"protection_evaluated":false,"operation_scope_completed":result.state==ExecutionState::Completed,"revocation_observation":executor.cloud.last_revocation_evidence(),
         "current_protection_rechecked":false,"operation":result,"steps":steps});
+    crate::qualification_cli::annotate_owned_iam(&change, &steps, &mut output);
     output["intent_qualification"] =
         serde_json::to_value(&intent_qualification).map_err(|_| GuardError::StorageFailed)?;
     output["ownership_context_failed"] = serde_json::json!(ownership_context_failed);

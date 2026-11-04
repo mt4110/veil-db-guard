@@ -1,6 +1,6 @@
 # K12 GCP PostgreSQLの所有IAM差分の限定補償
 
-2026-11-05。設計のみ。GCP Cloud SQL PostgreSQL 16.15、asia-northeast1、専用サービスアカウントのStanding Grantを対象に、導入中にVeilが追加したIAM許可だけを一度の更新で取り除く。既存の復旧経路を使い、元の導入操作と補償操作を別々に台帳へ残す。
+2026-11-05。GCP Cloud SQL PostgreSQL 16.15、asia-northeast1、専用サービスアカウントのStanding Grantを対象に、導入中にVeilが追加したIAM許可だけを一度の更新で取り除く。既存の復旧経路を使い、元の導入操作と補償操作を別々に台帳へ残す。
 
 ## 補償する差分
 
@@ -67,4 +67,14 @@ K06の `guard recover` は現在desiredを修復する。K12は同じ入口の�
 | 書き込み前後にプロセス停止、応答喪失・遅延、receipt確定失敗、複数プロセスからのbegin・resume | 承認範囲の拡大と曖昧な再送がない。現在の行の不在だけで所有や成功を作らず、再開後も元履歴を保持 |
 | 2行除去後に接続成功、古い証拠、独立Recoveryの失敗、新鮮で同一scopeの観測 | 構成補償と保護評価を分離し、Allowed、Unknown、確認できた効果を現在の証拠に従って出す |
 
-実装順は、所有receiptの生成・保存、補償plan/承認/CAS、GCPの限定executorと再開、実効表示と回帰の順とする。最初の受入はfake provider、実SQLite、別プロセスCLIで行う。この文書の作成時点では機能実装、実クラウド更新、実DB検証は行っていない。
+実装順は、所有receiptの生成・保存、補償plan/承認/CAS、GCPの限定executorと再開、実効表示と回帰の順とする。最初の受入はfake provider、実SQLite、別プロセスCLIで行う。
+
+## 実装された操作
+
+1. 元の導入を停止し、元の承認を取り消す。台帳に同じ操作の `ConfigureIdentity` と型付き所有receiptが必要。
+2. `guard recover --compensate-owned-iam` で計画を作成し、`guard approve`、`guard begin --expected-desired-head` で承認とDeny revisionを登録する。
+3. 新しいoperationに対し、`guard attest --kind exclusive-native-change-window` と `--kind owned-iam-compensation-ready` の資料を作る。同じoperatorが、変更windowの開始後に対象SAのworkload・復旧経路での非使用を確認して記録する。これらは運用者の申告であり、Veilが外部workloadの全数やfreezeを自動確認したことを意味しない。
+4. 同じ補償changeに対し、独立Recoveryの新しい接続・必要なTLS証拠を取得・受入する。承認、変更window、登録済みsourceを使い、既存の `guard apply-gcp` で実行する。IAM更新の直前に、対象とSAの世代、回復経路、台帳上の承認・desired head・leaseを再確認する。project IAMの競合は元のetagを使う条件付き更新で防ぐ。
+5. 成功応答を保存した操作は、再実行時に読み取りで確認する。出力の `owned_iam_delta_removed` は受理・再読が揃った場合に真になる。応答が不明なまま両行の不在を読めた場合は `unattributed_iam_absence_recorded` で区別する。現在の保護状態は別途 `guard state`／`guard status` で評価する。
+
+ローカルでは模擬GCPと実SQLite、別プロセスのCLIを使う。実GCPでのIAM更新・伝播・DB接続は今回の検証範囲外。

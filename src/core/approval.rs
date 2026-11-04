@@ -78,7 +78,7 @@ pub fn issue(
         .collect::<Vec<_>>();
     allowed_repair_recipe_hashes.sort();
     let mut grant = ApprovalGrant {
-        schema_version: 1,
+        schema_version: if change.schema_version == 3 { 2 } else { 1 },
         id: id.into(),
         approval_hash: String::new(),
         change_hash: change.change_hash.clone(),
@@ -102,10 +102,17 @@ impl ApprovalGrant {
     fn computed_hash(&self) -> Result<String, ApprovalError> {
         let mut copy = self.clone();
         copy.approval_hash.clear();
-        Ok(digest("approval", &copy)?)
+        Ok(digest(
+            if self.schema_version == 2 {
+                "gcp-iam-owned-compensation-approval"
+            } else {
+                "approval"
+            },
+            &copy,
+        )?)
     }
     pub fn verify_integrity(&self) -> Result<(), ApprovalError> {
-        if self.schema_version != 1
+        if !matches!(self.schema_version, 1 | 2)
             || !valid_id(&self.id)
             || !valid_id(&self.approver)
             || !valid_execution_identity(&self.execution_identity)
@@ -142,7 +149,8 @@ impl ApprovalGrant {
             .map(|recipe| recipe.recipe_hash.clone())
             .collect::<Vec<_>>();
         recipes.sort();
-        if self.change_hash != change.change_hash
+        if self.schema_version != if change.schema_version == 3 { 2 } else { 1 }
+            || self.change_hash != change.change_hash
             || self.policy_revision_hash != change.plan.policy_revision_hash
             || self.target_scope_hash != change.target_scope_hash()?
             || self.allowed_step_ids != steps

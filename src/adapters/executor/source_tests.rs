@@ -12,6 +12,7 @@ use crate::{
         source_execution::{tests as fixture, *},
     },
 };
+use serde_json::{Value, json};
 use std::{cell::Cell, rc::Rc};
 const ID: &str = "runner";
 struct Gate {
@@ -54,6 +55,8 @@ struct Provider {
     writes: usize,
     instance: CloudSqlInstance,
     clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    policy: Value,
+    iam_error: Option<ProviderError>,
 }
 impl CloudSqlProvider for Provider {
     fn now(&self) -> u64 {
@@ -74,12 +77,38 @@ impl CloudSqlProvider for Provider {
         }
         .into())
     }
-    fn iam_policy(&mut self, _: &str) -> Result<serde_json::Value, ProviderError> {
-        Ok(serde_json::json!({"version":3,"etag":"local","bindings":[]}))
+    fn project_number(&mut self, _: &str) -> Result<String, ProviderError> {
+        Ok("123456".into())
     }
-    fn set_iam_policy(&mut self, _: &str, _: &serde_json::Value) -> Result<(), ProviderError> {
+    fn iam_policy(&mut self, _: &str) -> Result<Value, ProviderError> {
+        Ok(self.policy.clone())
+    }
+    fn set_iam_policy(&mut self, _: &str, policy: &Value) -> Result<(), ProviderError> {
         self.writes += 1;
-        Ok(())
+        if self.iam_error == Some(ProviderError::Conflict) || self.policy["etag"] != policy["etag"]
+        {
+            return Err(ProviderError::Conflict);
+        }
+        assert_eq!(policy["version"], 3);
+        self.policy = policy.clone();
+        self.policy["etag"] = json!(format!("iam-update-{}", self.writes));
+        if self.policy["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("condition").is_none())
+        {
+            self.policy["version"] = json!(1);
+        }
+        self.iam_error.map_or(Ok(()), Err)
+    }
+    fn set_iam_policy_receipt(
+        &mut self,
+        project: &str,
+        policy: &Value,
+    ) -> Result<Option<Value>, ProviderError> {
+        self.set_iam_policy(project, policy)?;
+        Ok(Some(self.policy.clone()))
     }
     fn users(&mut self, _: &Target) -> Result<Vec<CloudSqlUser>, ProviderError> {
         Ok(vec![])
@@ -202,6 +231,13 @@ fn setup(
                 writes: 0,
                 clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(130)),
                 instance,
+                policy: json!({
+                    "version": 1,
+                    "etag": "initial",
+                    "bindings": [{"role": "roles/viewer", "members": ["user:unrelated@example.com"]}],
+                    "auditConfigs": [{"service": "allServices", "auditLogConfigs": [{"logType": "DATA_WRITE"}]}]
+                }),
+                iam_error: None,
             },
             ID.into(),
             cp.clone(),
@@ -485,4 +521,230 @@ fn source_registration_rotated_during_setup_reads_blocks_the_actual_iam_write() 
     e.preflight(&c, s).unwrap();
     assert_eq!(e.submit(&c, s, &ticket(s)), Err(ExecutorError::NotApplied));
     assert_eq!(e.cloud.provider.writes, 0);
+}
+
+#[test]
+fn owned_iam_compensation_reopens_ledger_and_never_resends_an_ambiguous_write() {
+    use crate::core::{approval, lifecycle, orchestrator};
+    use crate::operation_store::OperationStore;
+    use serde_json::json;
+
+    struct Time(u64);
+    impl orchestrator::Clock for Time {
+        fn now(&mut self) -> u64 {
+            self.0
+        }
+    }
+    fn begin(
+        ledger: &mut OperationStore,
+        change: &PreparedChange,
+        name: &str,
+        head: Option<String>,
+        now: u64,
+    ) -> Operation {
+        let grant = approval::issue(change, name, "operator", ID, 500, 600, now).unwrap();
+        ledger.register_change(change).unwrap();
+        ledger.register_approval(change, &grant).unwrap();
+        ledger
+            .begin(&BeginRequest {
+                request_id: name.into(),
+                operation_id: name.into(),
+                change_hash: change.change_hash.clone(),
+                approval_id: grant.id,
+                expected_desired_head: head,
+                execution_identity: ID.into(),
+                now,
+            })
+            .unwrap()
+    }
+
+    for scenario in [
+        "success",
+        "response-lost",
+        "cas-conflict",
+        "stale-etag",
+        "recovery-expired",
+    ] {
+        let lose_response = scenario == "response-lost";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.sqlite");
+        let (change, mut executor, _) = setup(usize::MAX);
+        let baseline = json!({
+            "version": 1, "etag": "initial",
+            "bindings": [{"role":"roles/viewer","members":["user:someone@example.test"]}],
+            "auditConfigs": [{"service":"allServices","auditLogConfigs":[{"logType":"ADMIN_READ"}]}]
+        });
+        executor.cloud.provider.policy = baseline.clone();
+        let mut ledger = OperationStore::open(&path).unwrap();
+        let mut source = begin(&mut ledger, &change, "original", None, 101);
+        let leases = ledger.acquire_leases(&source.id, "test", 120, 60).unwrap();
+        for step in &change.plan.steps {
+            let ticket = ledger
+                .dispatch(&source.id, &step.id, source.version, &leases, ID, 130)
+                .unwrap();
+            if step.action == ActionKind::ConfigureIdentity {
+                let result = executor.submit(&change, step, &ticket).unwrap();
+                let owned = executor
+                    .take_gcp_iam_owned_delta()
+                    .expect("fresh owned IAM delta");
+                source = ledger
+                    .record_owned_iam_receipt(&ticket, &result, &owned, 130)
+                    .unwrap();
+                break;
+            }
+            source = ledger
+                .record_receipt(
+                    &ticket,
+                    &StepReceipt {
+                        state: StepState::NoOpSatisfied,
+                        effect: EffectState::Enforced,
+                        native_operation_ref: None,
+                        evidence_refs: vec![],
+                    },
+                    130,
+                )
+                .unwrap();
+        }
+        assert_eq!(executor.cloud.provider.writes, 1);
+        ledger.release_leases(&leases).unwrap();
+        let source = ledger
+            .set_state(&source.id, source.version, ExecutionState::Cancelled, 131)
+            .unwrap();
+        ledger.cancel_approval(&source.approval_id, 131).unwrap();
+        let owned = ledger
+            .owned_iam_compensation_source(&source.id, "billing-access")
+            .unwrap();
+        let compensation = lifecycle::prepare_owned_iam_compensation(
+            &change,
+            &owned,
+            "billing-access",
+            132,
+            OperationLimits {
+                max_repair_executions: 0,
+                ..change.limits.clone()
+            },
+        )
+        .unwrap();
+        let operation = begin(
+            &mut ledger,
+            &compensation,
+            "compensation",
+            Some(source.policy_revision_hash.clone()),
+            133,
+        );
+        let checkpoints = ManualCheckpoints {
+            receipts: [
+                CheckpointKind::ExclusiveNativeChangeWindow,
+                CheckpointKind::OwnedIamCompensationReady,
+            ]
+            .into_iter()
+            .map(|kind| {
+                ManualCheckpoint::attest(
+                    &compensation,
+                    "billing-db",
+                    kind,
+                    "recovery-operator",
+                    133,
+                    600,
+                )
+                .unwrap()
+            })
+            .collect(),
+        };
+        let provider = executor.cloud.provider;
+        provider
+            .clock
+            .store(140, std::sync::atomic::Ordering::SeqCst);
+        let mut executor = GcpProtectionExecutor {
+            cloud: GcpExecutor::new(provider, ID.into(), checkpoints.clone()),
+            postgres: executor.postgres,
+            binding: BindingStepExecutor::new(ID.into(), checkpoints, 140),
+            source: Some(Box::new(Gate {
+                calls: Default::default(),
+                expire_on: if scenario == "recovery-expired" {
+                    3
+                } else {
+                    usize::MAX
+                },
+                advance_clock: None,
+                facts: fixture::facts(&compensation, false, false),
+            })),
+            query_only: false,
+        };
+        executor.cloud.provider.iam_error = match scenario {
+            "response-lost" => Some(ProviderError::Unknown),
+            "cas-conflict" => Some(ProviderError::Conflict),
+            _ => None,
+        };
+        if scenario == "stale-etag" {
+            executor.cloud.provider.policy["etag"] = json!("unrelated-update");
+        }
+        let before_compensation = executor.cloud.provider.policy.clone();
+        let operation = orchestrator::resume_with_clock(
+            &mut ledger,
+            &operation.id,
+            operation.version,
+            "test",
+            &mut Time(140),
+            &mut executor,
+        )
+        .unwrap();
+        let step = &ledger.steps(&operation.id).unwrap()[0];
+        let blocked_state = match scenario {
+            "stale-etag" => Some(StepState::Prepared),
+            "cas-conflict" => Some(StepState::Failed),
+            "recovery-expired" => Some(StepState::NotApplied),
+            _ => None,
+        };
+        if let Some(state) = blocked_state {
+            assert_eq!(step.state, state, "{scenario}");
+            assert_eq!(
+                executor.cloud.provider.writes,
+                1 + usize::from(scenario == "cas-conflict")
+            );
+            assert_eq!(executor.cloud.provider.policy, before_compensation);
+            continue;
+        }
+        assert_eq!(
+            step.state,
+            if lose_response {
+                StepState::OutcomeUnknown
+            } else {
+                StepState::ConfigApplied
+            }
+        );
+        assert_eq!(executor.cloud.provider.writes, 2);
+        let policy = &executor.cloud.provider.policy;
+        assert_eq!(policy["version"], 1);
+        assert_eq!(policy["bindings"], baseline["bindings"]);
+        assert_eq!(policy["auditConfigs"], baseline["auditConfigs"]);
+
+        drop(ledger);
+        let mut ledger = OperationStore::open_existing(&path).unwrap();
+        let operation = orchestrator::resume_with_clock(
+            &mut ledger,
+            &operation.id,
+            operation.version,
+            "test",
+            &mut Time(141),
+            &mut executor,
+        )
+        .unwrap();
+        let steps = ledger.steps(&operation.id).unwrap();
+        assert_eq!(
+            steps[0].receipt.as_ref().unwrap().effect,
+            EffectState::Unknown
+        );
+        assert_eq!(executor.cloud.provider.writes, 2);
+        if lose_response {
+            assert_eq!(steps[0].state, StepState::OutcomeUnknown);
+            assert!(steps[0].receipt.as_ref().unwrap().evidence_refs.contains(
+                &owned_iam_unattributed_absence_ref(&compensation, &compensation.plan.steps[0])
+            ));
+        } else {
+            assert_eq!(steps[0].state, StepState::Compensated);
+            assert_eq!(operation.state, ExecutionState::Completed);
+        }
+        assert_eq!(ledger.get(&source.id).unwrap(), source);
+    }
 }

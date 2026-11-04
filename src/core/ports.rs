@@ -1,6 +1,6 @@
 //! Infrastructure contracts required by the change-control kernel.
 use super::{admission::*, evidence::ObservationBundleWire};
-use super::{change::PreparedChange, operation::*};
+use super::{change::PreparedChange, operation::*, owned_iam::OwnedIamDeltaReceipt};
 
 /// Local trusted storage, not portable attestation. admit must atomically bind
 /// one issued nonce to one digest, rechecking source trust and original expiry.
@@ -112,6 +112,27 @@ pub trait OperationLedger {
         receipt: &StepReceipt,
         now: u64,
     ) -> Result<Operation, StoreError>;
+    /// Save adapter-confirmed ownership with the original dispatch result.
+    /// A ledger without the typed persistence boundary must reject it.
+    fn record_owned_iam_receipt(
+        &mut self,
+        _ticket: &DispatchTicket,
+        _receipt: &StepReceipt,
+        _owned: &OwnedIamDeltaReceipt,
+        _now: u64,
+    ) -> Result<Operation, StoreError> {
+        Err(StoreError::Invalid)
+    }
+    /// Recheck the durable fence after provider preconditions and immediately
+    /// before the owned IAM update. No transaction spans the provider call.
+    fn validate_owned_iam_dispatch(
+        &self,
+        _ticket: &DispatchTicket,
+        _execution_identity: &str,
+        _now: u64,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Invalid)
+    }
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         &mut self,

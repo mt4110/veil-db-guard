@@ -19,6 +19,8 @@ pub enum PlanLimitation {
     NativeWritesNotImplemented,
     OperationJournalNotImplemented,
     RecoveryExecutionNotImplemented,
+    CurrentOwnedIamStateUnconfirmed,
+    CurrentWorkloadUseUnconfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +42,7 @@ pub struct PlanStep {
     pub grant_id: String,
     pub profile_id: String,
     pub action: ActionKind,
-    /// Every parameter is resolved from the exact embedded policy revision.
+    /// Digest of the exact policy-bound parameters, including a source receipt when required.
     pub parameters_hash: String,
     pub dependencies: Vec<String>,
     pub adapter_contract: String,
@@ -87,6 +89,105 @@ pub enum PlanError {
     ScopeViolation,
 }
 
+pub const OWNED_IAM_COMPENSATION_CONTRACT: &str = "gcp-iam-owned-compensation-v1";
+
+pub(crate) fn build_owned_iam_plan(
+    policy: &PolicyRevision,
+    receipt: &super::owned_iam::OwnedIamDeltaReceipt,
+    created_at: u64,
+    build_id: &str,
+) -> Result<ChangePlan, PlanError> {
+    use super::capability::{CapabilityConstraint, Coverage, Implementation, Support};
+
+    if !is_digest(build_id) {
+        return Err(PlanError::CapabilityInvalid);
+    }
+    let policy_hash = policy
+        .revision_hash()
+        .map_err(|_| PlanError::PolicyInvalid)?;
+    let grant = policy
+        .grants
+        .iter()
+        .find(|grant| grant.id == receipt.grant_id)
+        .ok_or(PlanError::PolicyInvalid)?;
+    let target = policy
+        .targets
+        .iter()
+        .find(|target| target.id == grant.target)
+        .ok_or(PlanError::PolicyInvalid)?;
+    let profile = policy
+        .protection_profiles
+        .iter()
+        .find(|profile| profile.id == grant.profile)
+        .ok_or(PlanError::PolicyInvalid)?;
+    let action = ActionKind::CompensateOwnedIam;
+    let capability = CapabilityDescriptor {
+        support: Support::Supported,
+        implementation: Implementation::Implemented,
+        coverage: Coverage::None,
+        contract_revision: OWNED_IAM_COMPENSATION_CONTRACT.into(),
+        constraints: vec![
+            CapabilityConstraint::TargetGenerationUnconfirmed,
+            CapabilityConstraint::ExternalConcurrencyUnprotected,
+            CapabilityConstraint::NoEvidence,
+        ],
+        ..CapabilityDescriptor::planned(target.placement.kind, target.engine.family, action)
+            .for_target(target)
+    };
+    let parameters_hash = super::change::digest(
+        "gcp-iam-owned-compensation-parameters",
+        &(&policy_hash, receipt.hash()),
+    )
+    .map_err(|_| PlanError::PolicyInvalid)?;
+    let mut graph = ChangePlan {
+        schema_version: 2,
+        plan_hash: String::new(),
+        policy_revision_hash: policy_hash,
+        build_id: build_id.into(),
+        created_at,
+        targets: vec![target.clone()],
+        steps: vec![PlanStep {
+            id: "compensate-owned-iam".into(),
+            target_id: target.id.clone(),
+            grant_id: grant.id.clone(),
+            profile_id: profile.id.clone(),
+            action,
+            parameters_hash,
+            dependencies: vec![],
+            adapter_contract: OWNED_IAM_COMPENSATION_CONTRACT.into(),
+            preconditions: vec![
+                Precondition::TargetIdentityRevalidated,
+                Precondition::ManagedSurfaceRevalidated,
+                Precondition::NativeVersionMatches,
+                Precondition::NativeCasOrExclusiveChangeWindow,
+                Precondition::RecoveryRouteReady,
+            ],
+        }],
+        capabilities: vec![capability],
+        capability_gaps: vec![],
+        required_effect_gaps: profile
+            .required_effects
+            .iter()
+            .map(|effect| RequiredEffectGap {
+                target_id: target.id.clone(),
+                grant_id: grant.id.clone(),
+                effect: *effect,
+            })
+            .collect(),
+        limitations: vec![
+            PlanLimitation::TargetGenerationUnconfirmed,
+            PlanLimitation::CurrentOwnedIamStateUnconfirmed,
+            PlanLimitation::CurrentWorkloadUseUnconfirmed,
+        ],
+        observation_refs: vec![],
+        execution_available: false,
+        protection_evaluated: false,
+    };
+    graph.plan_hash = super::change::digest("gcp-iam-owned-compensation-plan", &graph)
+        .map_err(|_| PlanError::PolicyInvalid)?;
+    Ok(graph)
+}
+
 /// No observed change, capability or operator statement becomes a claim that
 /// the desired protection is applied. The first version intentionally emits
 /// no executable receipt or approval: those require K04's durable executor.
@@ -125,6 +226,9 @@ pub(crate) fn build_selected_plan(
         return Err(PlanError::CapabilityInvalid);
     }
     for capability in &capabilities {
+        if capability.action == ActionKind::CompensateOwnedIam {
+            return Err(PlanError::CapabilityInvalid);
+        }
         if policy.schema_version == 2
             && super::capability::requires_source_evidence(capability.action)
             && !matches!(

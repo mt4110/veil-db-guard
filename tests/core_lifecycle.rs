@@ -9,6 +9,7 @@ use veil_db_guard::{
         lifecycle::*,
         operation::*,
         orchestrator::{self, Clock, ExecutorError, StepExecutor},
+        owned_iam::{OwnedIamBinding, OwnedIamDeltaReceipt},
         plan::{PlanStep, build_plan},
         policy::*,
     },
@@ -25,6 +26,148 @@ fn source() -> PreparedChange {
     )
     .unwrap();
     prepare_change(&p, &plan, &[], None, OperationLimits::default()).unwrap()
+}
+
+fn owned_iam_source(mut policy: PolicyRevision) -> (PreparedChange, OwnedIamDeltaReceipt) {
+    policy.targets[0].resource.generation_fingerprint = Some("a".repeat(64));
+    policy.subjects[0].identity.immutable_id = Some("123456789012345678901".into());
+    let plan = build_plan(&policy, vec![], vec![], 100).unwrap();
+    let source = prepare_change(&policy, &plan, &[], None, OperationLimits::default()).unwrap();
+    let target = &source.policy.targets[0];
+    let grant = &source.policy.grants[0];
+    let subject = source
+        .policy
+        .subjects
+        .iter()
+        .find(|subject| subject.id == grant.subject)
+        .unwrap();
+    let receipt = OwnedIamDeltaReceipt {
+        source_operation_id: "source".into(),
+        source_change_hash: source.change_hash.clone(),
+        source_policy_revision_hash: plan.policy_revision_hash.clone(),
+        source_step_id: plan
+            .steps
+            .iter()
+            .find(|step| step.action == ActionKind::ConfigureIdentity)
+            .unwrap()
+            .id
+            .clone(),
+        attempt: 1,
+        idempotency_key: "b".repeat(64),
+        execution_identity: "runner".into(),
+        step_receipt_hash: "c".repeat(64),
+        project_id: target.placement.account_id.clone(),
+        project_number: "123456789012".into(),
+        native_resource_id: target.resource.native_id.clone(),
+        registration_id: target.registration_id.clone(),
+        generation_fingerprint: "a".repeat(64),
+        engine_version: target.engine.version.clone(),
+        grant_id: grant.id.clone(),
+        service_account_email: subject.identity.principal.clone(),
+        service_account_unique_id: subject.identity.immutable_id.clone().unwrap(),
+        db_login: grant.db_identity.clone(),
+        before_etag: "old=".into(),
+        before_digest: "d".repeat(64),
+        before_read_at: 101,
+        after_etag: "new=".into(),
+        after_digest: "e".repeat(64),
+        after_read_at: 102,
+        bindings: OwnedIamBinding::for_grant(&source.policy.policy_id, target, grant, subject),
+    };
+    (source, receipt)
+}
+
+#[test]
+fn owned_iam_compensation_only_plans_the_receipted_pair() {
+    let policy = parse_policy(include_str!("../examples/core-policy-v2.yaml")).unwrap();
+    let (source, mut receipt) = owned_iam_source(policy);
+    let limits = OperationLimits {
+        max_attempts: 2,
+        max_repair_executions: 0,
+        ..source.limits.clone()
+    };
+    let change =
+        prepare_owned_iam_compensation(&source, &receipt, &receipt.grant_id, 110, limits.clone())
+            .unwrap();
+    change.verify().unwrap();
+    validate_source(&change, &source).unwrap();
+    assert_eq!(change.plan.steps.len(), 1);
+    assert_eq!(change.plan.steps[0].action, ActionKind::CompensateOwnedIam);
+    assert_eq!(change.policy.grants[0].admission, AdmissionIntent::Deny);
+    assert_eq!(
+        change.policy.parent_revision_hash.as_ref(),
+        Some(&source.plan.policy_revision_hash)
+    );
+    assert!(change.repair_recipes.is_empty());
+    assert_eq!(change.plan.required_effect_gaps.len(), 1);
+    assert_eq!(
+        change.plan.required_effect_gaps[0].effect,
+        EffectKind::NewConnectionsDenied
+    );
+    assert!(!change.plan.protection_evaluated);
+    assert!(
+        change
+            .conflict_keys
+            .iter()
+            .any(|key| key.field_or_domain == "iam")
+    );
+    assert!(change.differences.iter().any(|difference| {
+        difference.field == DifferenceField::OwnedGcpIamBindings
+            && difference.kind == DifferenceKind::Removed
+    }));
+    assert!(
+        prepare_change(
+            &change.policy,
+            &change.plan,
+            &[],
+            Some(&source.policy),
+            limits.clone()
+        )
+        .is_err()
+    );
+    let approval =
+        approval::issue(&change, "approval", "operator", "runner", 200, 300, 110).unwrap();
+    assert_eq!(approval.schema_version, 2);
+    approval.validate(&change, "runner", 111, false).unwrap();
+
+    receipt.after_etag = "another=".into();
+    let other =
+        prepare_owned_iam_compensation(&source, &receipt, &receipt.grant_id, 110, limits.clone())
+            .unwrap();
+    assert_ne!(other.plan.plan_hash, change.plan.plan_hash);
+    assert!(approval.validate(&other, "runner", 111, false).is_err());
+
+    receipt.bindings[0]
+        .condition
+        .description
+        .push_str(" modified");
+    assert!(
+        prepare_owned_iam_compensation(&source, &receipt, &receipt.grant_id, 110, limits).is_err()
+    );
+}
+
+#[test]
+fn owned_iam_compensation_refuses_out_of_scope_or_shared_service_accounts() {
+    let v1 = parse_policy(include_str!("../examples/core-policy.yaml")).unwrap();
+    let v2 = parse_policy(include_str!("../examples/core-policy-v2.yaml")).unwrap();
+    let mut wrong_region = v2.clone();
+    wrong_region.targets[0].placement.region = "us-central1".into();
+    let mut shared = v2;
+    shared.subjects[1].identity.immutable_id = Some("123456789012345678901".into());
+
+    for (policy, scope_matches) in [(v1, false), (wrong_region, false), (shared, true)] {
+        let (source, receipt) = owned_iam_source(policy);
+        assert_eq!(receipt.matches_change(&source), scope_matches);
+        let limits = OperationLimits {
+            max_attempts: 2,
+            max_repair_executions: 0,
+            ..source.limits.clone()
+        };
+        assert!(
+            prepare_owned_iam_compensation(&source, &receipt, &receipt.grant_id, 110, limits)
+                .is_err()
+        );
+    }
 }
 fn maintenance(s: &PreparedChange, kind: LifecycleKind, sql: bool) -> PreparedChange {
     prepare_maintenance(

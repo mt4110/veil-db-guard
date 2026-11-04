@@ -3,9 +3,12 @@ use crate::{
     config::hash_bytes,
     core::{
         approval::ApprovalGrant,
+        capability::ActionKind,
         change::{ConflictKey, PreparedChange},
+        lifecycle::LifecycleKind,
         operation::*,
-        policy::{valid_hash, valid_id},
+        owned_iam::OwnedIamDeltaReceipt,
+        policy::{PolicyRevision, valid_hash, valid_id},
         ports::OperationLedger,
     },
 };
@@ -81,6 +84,23 @@ impl OperationLedger for OperationStore {
         now: u64,
     ) -> Result<Operation, StoreError> {
         OperationStore::record_receipt(self, ticket, receipt, now)
+    }
+    fn record_owned_iam_receipt(
+        &mut self,
+        ticket: &DispatchTicket,
+        receipt: &StepReceipt,
+        owned: &OwnedIamDeltaReceipt,
+        now: u64,
+    ) -> Result<Operation, StoreError> {
+        OperationStore::record_owned_iam_receipt(self, ticket, receipt, owned, now)
+    }
+    fn validate_owned_iam_dispatch(
+        &self,
+        ticket: &DispatchTicket,
+        execution_identity: &str,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        OperationStore::validate_owned_iam_dispatch(self, ticket, execution_identity, now)
     }
     fn resolve(
         &mut self,
@@ -440,7 +460,7 @@ impl OperationStore {
         let tx = db(self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate))?;
-        check_lifecycle_source(&tx, change)?;
+        check_lifecycle_source(&tx, change, None)?;
         let existing: Option<String> = db(tx
             .query_row(
                 "SELECT body FROM plans WHERE hash=?1",
@@ -525,6 +545,29 @@ impl OperationStore {
     }
     pub fn desired_head(&self, policy_id: &str) -> Result<Option<String>, StoreError> {
         active_desired(&self.connection, policy_id)
+    }
+    /// Planning uses one SQLite snapshot. Begin independently repeats these
+    /// checks under the write lock before reserving the receipt and moving head.
+    pub fn owned_iam_compensation_source(
+        &self,
+        operation_id: &str,
+        grant_id: &str,
+    ) -> Result<OwnedIamDeltaReceipt, StoreError> {
+        let tx = db(self.connection.unchecked_transaction())?;
+        let operation = get_operation(&tx, operation_id)?;
+        let source = get_change(&tx, &operation.change_hash)?;
+        let receipt = load_owned_iam_source(&tx, &operation, &source, grant_id)?;
+        check_owned_iam_reservation(&tx, &operation, &receipt, None)?;
+        if crate::core::lifecycle::owned_iam_conflicts_with_policy(
+            &source.policy,
+            &receipt,
+            Some(grant_id),
+        ) {
+            return Err(StoreError::Conflict);
+        }
+        check_other_desired_iam_use(&tx, &operation.policy_id, &receipt)?;
+        check_other_unresolved(&tx, &operation, &source)?;
+        Ok(receipt)
     }
     pub fn get(&self, id: &str) -> Result<Operation, StoreError> {
         get_operation(&self.connection, id)
@@ -615,7 +658,7 @@ impl OperationStore {
             return Ok(op);
         }
         let change = get_change(&tx, &request.change_hash)?;
-        check_lifecycle_source(&tx, &change)?;
+        check_lifecycle_source(&tx, &change, None)?;
         check_repair_budget(&tx, &change)?;
         let approval = get_approval(&tx, &request.approval_id)?;
         ensure_approval(
@@ -639,6 +682,9 @@ impl OperationStore {
         if current.is_none() && change.policy.parent_revision_hash.is_some() {
             return Err(StoreError::Conflict);
         }
+        if current.as_deref() != Some(change.plan.policy_revision_hash.as_str()) {
+            check_owned_iam_head_fence(&tx, &change, request.now)?;
+        }
         let op = Operation {
             id: request.operation_id.clone(),
             request_id: request.request_id.clone(),
@@ -655,6 +701,12 @@ impl OperationStore {
             updated_at: request.now,
         };
         db(tx.execute("INSERT INTO operations(id,request_id,input_hash,change_hash,approval_id,policy_id,version,state,body) VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8)",params![op.id,op.request_id,op.input_hash,op.change_hash,op.approval_id,op.policy_id,encoded(&op.state)?,encoded(&op)?]))?;
+        if let Some(owned) = change.lifecycle.as_ref().and_then(|c| c.owned_iam.as_ref()) {
+            db(tx.execute(
+                "INSERT INTO owned_iam_compensations(receipt_hash,operation_id) VALUES(?1,?2)",
+                params![owned.hash(), op.id],
+            ))?;
+        }
         db(tx.execute("INSERT INTO desired_heads(policy_id,revision_hash) VALUES(?1,?2) ON CONFLICT(policy_id) DO UPDATE SET revision_hash=excluded.revision_hash",params![op.policy_id,op.policy_revision_hash]))?;
         for (ordinal, step) in change.plan.steps.iter().enumerate() {
             let key = hash_bytes(
@@ -843,7 +895,7 @@ impl OperationStore {
             return Err(StoreError::Transition);
         }
         let change = get_change(&tx, &op.change_hash)?;
-        check_lifecycle_source(&tx, &change)?;
+        check_lifecycle_source(&tx, &change, Some(&op.id))?;
         let approval = get_approval(&tx, &op.approval_id)?;
         ensure_approval(&tx, &change, &approval, identity, now, false)?;
         if identity != op.execution_identity {
@@ -923,6 +975,77 @@ impl OperationStore {
             None,
             now,
             Some(ticket),
+            None,
+        )
+    }
+    pub fn validate_owned_iam_dispatch(
+        &self,
+        ticket: &DispatchTicket,
+        execution_identity: &str,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        timestamp(now)?;
+        let tx = db(self.connection.unchecked_transaction())?;
+        let operation = get_operation(&tx, &ticket.operation_id)?;
+        if operation.version != ticket.operation_version
+            || operation.state != ExecutionState::Running
+        {
+            return Err(StoreError::Stale);
+        }
+        let change = get_change(&tx, &operation.change_hash)?;
+        if !change
+            .plan
+            .steps
+            .iter()
+            .any(|step| step.id == ticket.step_id && step.action == ActionKind::CompensateOwnedIam)
+        {
+            return Err(StoreError::Invalid);
+        }
+        let step = get_step(&tx, &operation.id, &ticket.step_id)?;
+        if step.state != StepState::Dispatching
+            || step.attempt != ticket.attempt
+            || step.idempotency_key != ticket.idempotency_key
+            || load_dispatch_ticket(&tx, ticket)? != *ticket
+        {
+            return Err(StoreError::Stale);
+        }
+        check_lifecycle_source(&tx, &change, Some(&operation.id))?;
+        if operation.execution_identity != execution_identity {
+            return Err(StoreError::Approval);
+        }
+        let approval = get_approval(&tx, &operation.approval_id)?;
+        ensure_approval(&tx, &change, &approval, execution_identity, now, false)?;
+        check_leases(&tx, &operation, &change, &ticket.leases, now)?;
+        if active_desired(&tx, &operation.policy_id)?.as_deref()
+            != Some(operation.policy_revision_hash.as_str())
+        {
+            return Err(StoreError::Conflict);
+        }
+        if now < operation.updated_at
+            || now.saturating_sub(operation.created_at) >= change.limits.max_operation_seconds
+            || operation.attempts > change.limits.max_attempts
+        {
+            return Err(StoreError::Limit);
+        }
+        check_other_unresolved(&tx, &operation, &change)
+    }
+    pub fn record_owned_iam_receipt(
+        &mut self,
+        ticket: &DispatchTicket,
+        receipt: &StepReceipt,
+        owned: &OwnedIamDeltaReceipt,
+        now: u64,
+    ) -> Result<Operation, StoreError> {
+        self.record_result(
+            &ticket.operation_id,
+            &ticket.step_id,
+            ticket.operation_version,
+            &ticket.leases,
+            receipt,
+            None,
+            now,
+            Some(ticket),
+            Some(owned),
         )
     }
     // Keep operation/step/version/lease/identity/time explicit at this trust boundary.
@@ -946,6 +1069,7 @@ impl OperationStore {
             Some(identity),
             now,
             None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -959,6 +1083,7 @@ impl OperationStore {
         identity: Option<&str>,
         now: u64,
         ticket: Option<&DispatchTicket>,
+        owned: Option<&OwnedIamDeltaReceipt>,
     ) -> Result<Operation, StoreError> {
         timestamp(now)?;
         validate_receipt(receipt)?;
@@ -984,6 +1109,38 @@ impl OperationStore {
                 || ticket.idempotency_key != step.idempotency_key)
         {
             return Err(StoreError::Stale);
+        }
+        let specification = change
+            .plan
+            .steps
+            .iter()
+            .find(|s| s.id == step_id)
+            .ok_or(StoreError::NotFound)?;
+        if specification.action == ActionKind::CompensateOwnedIam {
+            match (ticket.is_some(), step.state, receipt.state) {
+                // A failed read must preserve the accepted response used to
+                // reconcile a later independent read. No second write follows.
+                (false, StepState::ConfigApplied, StepState::OutcomeUnknown) => return Ok(op),
+                (false, StepState::ConfigApplied, StepState::Compensated) => {
+                    if now.saturating_sub(op.created_at) >= change.limits.max_operation_seconds {
+                        return Err(StoreError::Limit);
+                    }
+                    get_approval(&tx, &op.approval_id)?
+                        .validate(&change, &op.execution_identity, now, true)
+                        .map_err(|_| StoreError::Approval)?;
+                }
+                (true, StepState::Dispatching, StepState::ConfigApplied)
+                    if receipt.native_operation_ref.is_some()
+                        && receipt.effect == EffectState::Unknown => {}
+                (true, StepState::Dispatching, StepState::Failed)
+                    if receipt.native_operation_ref.is_none()
+                        && receipt.effect == EffectState::Unknown => {}
+                (_, _, StepState::OutcomeUnknown)
+                | (true, StepState::Dispatching, StepState::NotApplied) => {}
+                _ => return Err(StoreError::Transition),
+            }
+        } else if receipt.state == StepState::Compensated {
+            return Err(StoreError::Transition);
         }
         if matches!(receipt.state, StepState::NotApplied)
             && matches!(step.state, StepState::ConfigApplied)
@@ -1016,7 +1173,9 @@ impl OperationStore {
             op.state = match receipt.state {
                 StepState::Submitted => ExecutionState::WaitingProvider,
                 StepState::ConfigApplied => ExecutionState::WaitingEffect,
-                StepState::EffectSatisfied | StepState::NoOpSatisfied => ExecutionState::Running,
+                StepState::EffectSatisfied | StepState::NoOpSatisfied | StepState::Compensated => {
+                    ExecutionState::Running
+                }
                 StepState::Failed => ExecutionState::FailedPartial,
                 _ => ExecutionState::NeedsAction,
             };
@@ -1033,6 +1192,7 @@ impl OperationStore {
                 now
             ],
         ))?;
+        let result_sequence = tx.last_insert_rowid();
         event(
             &tx,
             operation_id,
@@ -1044,6 +1204,21 @@ impl OperationStore {
             Some(step_id),
             now,
         )?;
+        if let Some(owned) = owned {
+            let ticket = ticket.ok_or(StoreError::Invalid)?;
+            let event_sequence = tx.last_insert_rowid();
+            save_owned_iam_receipt(
+                &tx,
+                &change,
+                &op,
+                ticket,
+                &stored_receipt,
+                owned,
+                result_sequence,
+                event_sequence,
+                now,
+            )?;
+        }
         db(tx.commit())?;
         Ok(op)
     }
@@ -1072,9 +1247,15 @@ impl OperationStore {
         if state == ExecutionState::Completed {
             let steps = all_steps(&tx, id)?;
             let change = get_change(&tx, &op.change_hash)?;
+            let compensation = change
+                .lifecycle
+                .as_ref()
+                .is_some_and(|c| c.kind == LifecycleKind::CompensateOwnedIam);
             if steps.is_empty()
-                || steps.iter().any(|s| !satisfied(s.state))
-                || !change.plan.required_effect_gaps.is_empty()
+                || (compensation && (steps.len() != 1 || steps[0].state != StepState::Compensated))
+                || (!compensation
+                    && (steps.iter().any(|s| !satisfied(s.state))
+                        || !change.plan.required_effect_gaps.is_empty()))
                 || active_desired(&tx, &op.policy_id)? != Some(op.policy_revision_hash.clone())
             {
                 return Err(StoreError::Transition);
@@ -1141,9 +1322,266 @@ fn ensure_approval(
         .validate(change, identity, now, recovery)
         .map_err(|_| StoreError::Approval)
 }
+
+fn matches_owned_iam_result(
+    change: &PreparedChange,
+    operation: &Operation,
+    ticket: &DispatchTicket,
+    receipt: &StepReceipt,
+    owned: &OwnedIamDeltaReceipt,
+) -> bool {
+    receipt.state == StepState::EffectSatisfied
+        && receipt.effect == EffectState::Enforced
+        && owned.matches_change(change)
+        && owned.source_operation_id == operation.id
+        && owned.source_operation_id == ticket.operation_id
+        && owned.source_step_id == ticket.step_id
+        && owned.source_policy_revision_hash == operation.policy_revision_hash
+        && owned.execution_identity == operation.execution_identity
+        && owned.attempt == ticket.attempt
+        && owned.idempotency_key == ticket.idempotency_key
+        && owned.step_receipt_hash == OwnedIamDeltaReceipt::step_receipt_hash(receipt)
+        && owned.before_read_at >= operation.created_at
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_owned_iam_receipt(
+    connection: &Connection,
+    change: &PreparedChange,
+    operation: &Operation,
+    ticket: &DispatchTicket,
+    receipt: &StepReceipt,
+    owned: &OwnedIamDeltaReceipt,
+    result_sequence: i64,
+    event_sequence: i64,
+    now: u64,
+) -> Result<(), StoreError> {
+    let (stored_ticket, dispatched_at): (String, u64) = db(connection.query_row(
+        "SELECT a.body,e.at FROM step_attempts a JOIN operation_events e
+         ON e.operation_id=a.operation_id AND e.step_id=a.step_id AND e.kind=?4
+         WHERE a.operation_id=?1 AND a.step_id=?2 AND a.attempt=?3
+         ORDER BY e.seq DESC LIMIT 1",
+        params![
+            operation.id,
+            ticket.step_id,
+            ticket.attempt,
+            encoded(&EventKind::Dispatched)?
+        ],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ))?;
+    if decoded::<DispatchTicket>(&stored_ticket)? != *ticket
+        || !matches_owned_iam_result(change, operation, ticket, receipt, owned)
+        || owned.before_read_at < dispatched_at
+        || owned.after_read_at > now
+    {
+        return Err(StoreError::Invalid);
+    }
+    // Additive v1 extension. Opening a legacy ledger does not create tables,
+    // and rollback removes even the first extension if its result cannot commit.
+    db(connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS owned_iam_receipts(
+            receipt_hash TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            result_seq INTEGER NOT NULL UNIQUE REFERENCES step_results(seq),
+            event_seq INTEGER NOT NULL UNIQUE REFERENCES operation_events(seq),
+            body TEXT NOT NULL,
+            UNIQUE(operation_id,step_id),
+            FOREIGN KEY(operation_id,step_id) REFERENCES steps(operation_id,step_id)
+        );
+        CREATE TABLE IF NOT EXISTS owned_iam_compensations(
+            receipt_hash TEXT PRIMARY KEY REFERENCES owned_iam_receipts(receipt_hash),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id)
+        );",
+    ))?;
+    db(connection.execute(
+        "INSERT INTO owned_iam_receipts(receipt_hash,operation_id,step_id,result_seq,event_seq,body)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![owned.hash(), operation.id, ticket.step_id, result_sequence, event_sequence, encoded(owned)?],
+    ))?;
+    Ok(())
+}
+
+fn load_dispatch_ticket(
+    connection: &Connection,
+    ticket: &DispatchTicket,
+) -> Result<DispatchTicket, StoreError> {
+    let body: String = db(connection.query_row(
+        "SELECT body FROM step_attempts WHERE operation_id=?1 AND step_id=?2 AND attempt=?3",
+        params![ticket.operation_id, ticket.step_id, ticket.attempt],
+        |r| r.get(0),
+    ))?;
+    decoded(&body)
+}
+
+fn load_owned_iam_source(
+    connection: &Connection,
+    operation: &Operation,
+    change: &PreparedChange,
+    grant_id: &str,
+) -> Result<OwnedIamDeltaReceipt, StoreError> {
+    if !matches!(
+        operation.state,
+        ExecutionState::Cancelled | ExecutionState::NeedsAction | ExecutionState::FailedPartial
+    ) || change.lifecycle.is_some()
+    {
+        return Err(StoreError::Transition);
+    }
+    let forward_revoked: bool = db(connection.query_row(
+        "SELECT cancelled FROM approvals WHERE id=?1",
+        [&operation.approval_id],
+        |r| r.get(0),
+    ))?;
+    if !forward_revoked {
+        return Err(StoreError::Approval);
+    }
+    let steps = all_steps(connection, &operation.id)?;
+    if steps.iter().any(|s| unresolved(s.state)) {
+        return Err(StoreError::Unresolved);
+    }
+    if change.plan.steps.iter().any(|spec| {
+        matches!(
+            spec.action,
+            ActionKind::PublishBinding
+                | ActionKind::AwaitApplicationCutover
+                | ActionKind::ConstrainDirectPath
+        ) && steps
+            .iter()
+            .any(|record| record.step_id == spec.id && record.attempt != 0)
+    }) {
+        return Err(StoreError::Transition);
+    }
+    let source_step = change
+        .plan
+        .steps
+        .iter()
+        .find(|s| s.action == ActionKind::ConfigureIdentity && s.grant_id == grant_id)
+        .ok_or(StoreError::NotFound)?;
+    let record = steps
+        .iter()
+        .find(|s| s.step_id == source_step.id && s.state == StepState::EffectSatisfied)
+        .ok_or(StoreError::NotFound)?;
+    let has_table: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='owned_iam_receipts')",
+        [],
+        |r| r.get(0),
+    ))?;
+    if !has_table {
+        return Err(StoreError::NotFound);
+    }
+    let row: Option<(String, String, String, String, u64)> = db(connection
+        .query_row(
+            "SELECT o.receipt_hash,o.body,r.body,a.body,r.at FROM owned_iam_receipts o
+             JOIN step_results r ON r.seq=o.result_seq AND r.operation_id=o.operation_id AND r.step_id=o.step_id
+             JOIN operation_events e ON e.seq=o.event_seq AND e.operation_id=o.operation_id AND e.step_id=o.step_id AND e.at=r.at
+             JOIN step_attempts a ON a.operation_id=o.operation_id AND a.step_id=o.step_id AND a.attempt=r.attempt
+             WHERE o.operation_id=?1 AND o.step_id=?2 AND r.attempt=?3 AND a.idempotency_key=?4 AND e.kind=?5",
+            params![operation.id, source_step.id, record.attempt, record.idempotency_key, encoded(&EventKind::ReceiptRecorded)?],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional())?;
+    let (hash, body, result, ticket, recorded_at) = row.ok_or(StoreError::NotFound)?;
+    let owned: OwnedIamDeltaReceipt = decoded(&body)?;
+    let result: StepReceipt = decoded(&result)?;
+    let ticket: DispatchTicket = decoded(&ticket)?;
+    if owned.hash() != hash
+        || record.receipt.as_ref() != Some(&result)
+        || !matches_owned_iam_result(change, operation, &ticket, &result, &owned)
+        || owned.after_read_at > recorded_at
+    {
+        return Err(StoreError::Invalid);
+    }
+    Ok(owned)
+}
+
+fn check_owned_iam_reservation(
+    connection: &Connection,
+    source: &Operation,
+    receipt: &OwnedIamDeltaReceipt,
+    compensation_operation_id: Option<&str>,
+) -> Result<(), StoreError> {
+    let reserved: Option<String> = db(connection
+        .query_row(
+            "SELECT operation_id FROM owned_iam_compensations WHERE receipt_hash=?1",
+            [receipt.hash()],
+            |r| r.get(0),
+        )
+        .optional())?;
+    if reserved.as_deref() != compensation_operation_id
+        || (compensation_operation_id.is_none()
+            && active_desired(connection, &source.policy_id)?.as_deref()
+                != Some(source.policy_revision_hash.as_str()))
+    {
+        return Err(StoreError::Conflict);
+    }
+    Ok(())
+}
+
+fn check_other_desired_iam_use(
+    connection: &Connection,
+    source_policy_id: &str,
+    owned: &OwnedIamDeltaReceipt,
+) -> Result<(), StoreError> {
+    let mut stmt = db(connection.prepare(
+        "SELECT p.body FROM desired_heads d JOIN policy_revisions p ON p.hash=d.revision_hash
+         WHERE d.policy_id<>?1 LIMIT 16385",
+    ))?;
+    let mut rows = db(stmt.query([source_policy_id]))?;
+    let mut scanned = 0;
+    while let Some(row) = db(rows.next())? {
+        scanned += 1;
+        if scanned > 16384 {
+            return Err(StoreError::Limit);
+        }
+        let body: String = db(row.get(0))?;
+        let policy: PolicyRevision = decoded(&body)?;
+        if crate::core::lifecycle::owned_iam_conflicts_with_policy(&policy, owned, None) {
+            return Err(StoreError::Conflict);
+        }
+    }
+    Ok(())
+}
+
+fn check_owned_iam_head_fence(
+    connection: &Connection,
+    change: &PreparedChange,
+    now: u64,
+) -> Result<(), StoreError> {
+    let has_table: bool = db(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='owned_iam_compensations')",
+        [],
+        |r| r.get(0),
+    ))?;
+    if !has_table {
+        return Ok(());
+    }
+    // Keep the desired state used in the final pre-send check stable while a
+    // compensation has a live dispatch fence. Provider I/O stays outside SQL.
+    let keys = conflict_keys(change);
+    let mut stmt = db(connection.prepare(
+        "SELECT o.policy_id,l.resource,l.domain FROM owned_iam_compensations c
+         JOIN operations o ON o.id=c.operation_id
+         JOIN resource_leases l ON l.operation_id=o.id
+         JOIN steps s ON s.operation_id=o.id WHERE l.expires_at>?1 AND s.state=?2",
+    ))?;
+    let mut rows = db(stmt.query(params![now, encoded(&StepState::Dispatching)?]))?;
+    while let Some(row) = db(rows.next())? {
+        let policy_id: String = db(row.get(0))?;
+        let held = ConflictKey {
+            resource_identity: db(row.get(1))?,
+            field_or_domain: db(row.get(2))?,
+        };
+        if policy_id == change.policy.policy_id || keys.iter().any(|key| key.conflicts(&held)) {
+            return Err(StoreError::Lease);
+        }
+    }
+    Ok(())
+}
+
 fn check_lifecycle_source(
     connection: &Connection,
     change: &PreparedChange,
+    compensation_operation_id: Option<&str>,
 ) -> Result<(), StoreError> {
     let Some(context) = &change.lifecycle else {
         return Ok(());
@@ -1154,7 +1592,7 @@ fn check_lifecycle_source(
     {
         return Err(StoreError::Conflict);
     }
-    if context.kind == crate::core::lifecycle::LifecycleKind::Recover
+    if context.kind == LifecycleKind::Recover
         && !matches!(
             operation.state,
             ExecutionState::Cancelled | ExecutionState::NeedsAction | ExecutionState::FailedPartial
@@ -1163,13 +1601,29 @@ fn check_lifecycle_source(
         return Err(StoreError::Transition);
     }
     let source = get_change(connection, &operation.change_hash)?;
-    crate::core::lifecycle::validate_source(change, &source).map_err(|_| StoreError::Invalid)
+    crate::core::lifecycle::validate_source(change, &source).map_err(|_| StoreError::Invalid)?;
+    if context.kind == LifecycleKind::CompensateOwnedIam {
+        let approved = context.owned_iam.as_ref().ok_or(StoreError::Invalid)?;
+        let owned = load_owned_iam_source(connection, &operation, &source, &approved.grant_id)?;
+        if approved != &owned {
+            return Err(StoreError::Conflict);
+        }
+        check_owned_iam_reservation(connection, &operation, &owned, compensation_operation_id)?;
+        check_other_desired_iam_use(connection, &operation.policy_id, &owned)?;
+        if compensation_operation_id.is_none() {
+            check_other_unresolved(connection, &operation, change)?;
+        }
+    }
+    Ok(())
 }
 fn check_repair_budget(connection: &Connection, change: &PreparedChange) -> Result<(), StoreError> {
     let Some(context) = &change.lifecycle else {
         return Ok(());
     };
-    if context.kind == crate::core::lifecycle::LifecycleKind::Revoke {
+    if matches!(
+        context.kind,
+        LifecycleKind::Revoke | LifecycleKind::CompensateOwnedIam
+    ) {
         return Ok(());
     }
     let source = get_change(connection, &context.source_change_hash)?;
@@ -1188,7 +1642,7 @@ fn check_repair_budget(connection: &Connection, change: &PreparedChange) -> Resu
         let prior: PreparedChange = decoded(&body)?;
         if prior.lifecycle.as_ref().is_some_and(|v| {
             v.source_operation_id == context.source_operation_id
-                && v.kind != crate::core::lifecycle::LifecycleKind::Revoke
+                && matches!(v.kind, LifecycleKind::Recover | LifecycleKind::Reconcile)
         }) {
             count += 1;
         }
@@ -1266,7 +1720,9 @@ fn validate_receipt(receipt: &StepReceipt) -> Result<(), StoreError> {
         StepState::EffectSatisfied | StepState::NoOpSatisfied => {
             receipt.effect == EffectState::Enforced
         }
-        StepState::OutcomeUnknown => receipt.effect == EffectState::Unknown,
+        StepState::OutcomeUnknown | StepState::Compensated => {
+            receipt.effect == EffectState::Unknown
+        }
         StepState::NotApplied | StepState::Failed => matches!(
             receipt.effect,
             EffectState::Unknown | EffectState::NotSatisfied

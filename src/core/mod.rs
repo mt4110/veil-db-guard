@@ -11,6 +11,7 @@ pub mod lifecycle;
 pub mod observation;
 pub mod operation;
 pub mod orchestrator;
+pub mod owned_iam;
 pub mod plan;
 pub mod policy;
 pub mod ports;

@@ -63,7 +63,7 @@ K09とK10-A〜Dの初期範囲に続き、[K10-E/Fの続編](core/k10-native-sou
 | K10-E2 | K10-E | AWS MySQLのmetadata-only DB認証・TLS/SQL取得producer。EC2 sourceとwire正規化は再利用 | 実装・L検証。接続/TLS/accountとpositive SQL観測。続編で全role closureによるnamed fresh ACLのtable action不在を追加。既存session・incarnation等は対象外 |
 | K10-F2 | K10-E/F | AWSのsource-aware閉鎖/失効stepを実行adapterへ接続。新契約と現在source、ownership、SG限定操作を維持 | 実装・L検証。新v3契約・変更直前hook・ConfigApplied/query-only・MySQL暗黙COMMIT境界を維持 |
 | K11 | K10共通契約後 | PostgreSQLの既存アプリ導入bundle、経路inventory、runtime境界、token/pool・切替・復旧手順。共通AWS認証をengine中立moduleへ整理 | AのUnix peer、B/Cの管理poolと型付き受入、Dの復旧gate、EのAWS接続を実装・ローカル検証。GCPは同一checkoutの署名と実Linux Unix peerの台帳受入をローカル検証。AWS PostgreSQLは同一checkout・同一トランザクションの独立照合、署名とSQLite/archive受入をローカル検証。AWS実環境の観測元構成とMySQLの独立runtimeは残る。[作業設計](core/k11-work-plan.md) |
-| K12 | K04/K06の台帳・recover。実効再判定はK10/K11 | 停止済みGCP PostgreSQL導入で `ConfigureIdentity` が追加した条件付きIAM 2行を一つの差分として補償。元操作の所有receipt、新承認、etagのCASと再開時の照会が受入条件 | [限定補償の設計](core/k12-owned-compensation.md)を作成。実装・検証未着手。session/drain・期限回収は今回の対象外 |
+| K12 | K04/K06の台帳・recover。実効再判定はK10/K11 | 停止済みGCP PostgreSQL導入で `ConfigureIdentity` が追加した条件付きIAM 2行を一つの差分として補償。元操作の所有receipt、新承認、etagのCASと再開時の照会が受入条件 | [限定補償](core/k12-owned-compensation.md)を実装し、模擬GCP・実SQLite・CLIでローカル検証。実GCP更新・伝播は未検証。session/drain・期限回収は今回の対象外 |
 
 詳細な根拠と受入条件は[照合記録](core/design-implementation-audit.md)へ記載します。追加フィジビリティやクラウド操作はこれらのローカル実装の開始条件にしません。
 

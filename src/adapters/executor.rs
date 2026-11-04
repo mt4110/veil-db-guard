@@ -47,6 +47,7 @@ fn source_guarded(step: &PlanStep) -> bool {
             | ActionKind::ConfirmRecoveryReadiness
             | ActionKind::ConstrainDirectPath
             | ActionKind::DisableNativeIdentity
+            | ActionKind::CompensateOwnedIam
             | ActionKind::DisableNewConnections
             | ActionKind::RevokeSqlPrivileges
             | ActionKind::ObserveRevocation
@@ -210,6 +211,9 @@ impl<P: CloudSqlProvider, G: CheckpointGate, T: PgTransport> StepExecutor
         s: &PlanStep,
         t: &DispatchTicket,
     ) -> Result<StepReceipt, ExecutorError> {
+        if s.action == ActionKind::CompensateOwnedIam {
+            return Err(ExecutorError::Unavailable);
+        }
         if !self.available(c, s) || self.cancelled() {
             return Err(ExecutorError::PreconditionsNotMet);
         }
@@ -254,12 +258,42 @@ impl<P: CloudSqlProvider, G: CheckpointGate, T: PgTransport> StepExecutor
                             .as_mut()
                             .ok_or(ExecutorError::Unavailable)?
                             .as_mut(),
+                        &mut || Ok(()),
                     )
                 } else {
                     self.cloud.submit(c, s, t)
                 }
             }?;
         self.finish_source(c, s, receipt)
+    }
+    fn submit_with_dispatch_check(
+        &mut self,
+        c: &PreparedChange,
+        s: &PlanStep,
+        t: &DispatchTicket,
+        check: &mut dyn FnMut() -> Result<(), ExecutorError>,
+    ) -> Result<StepReceipt, ExecutorError> {
+        if s.action != ActionKind::CompensateOwnedIam {
+            return self.submit(c, s, t);
+        }
+        if !self.available(c, s) || self.cancelled() {
+            return Err(ExecutorError::NotApplied);
+        }
+        self.source_precondition(c, s)
+            .map_err(|_| ExecutorError::NotApplied)?;
+        self.cloud.submit_source(
+            c,
+            s,
+            t,
+            self.source
+                .as_mut()
+                .ok_or(ExecutorError::Unavailable)?
+                .as_mut(),
+            check,
+        )
+    }
+    fn take_gcp_iam_owned_delta(&mut self) -> Option<crate::core::owned_iam::OwnedIamDeltaReceipt> {
+        self.cloud.take_gcp_iam_owned_delta()
     }
     fn query(
         &mut self,
