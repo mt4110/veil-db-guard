@@ -1,0 +1,43 @@
+[package]
+name = "veil-db-guard"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Local-first policy and change planning for existing database access protection"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+base64 = "=0.22.1"
+ring = "=0.17.14"
+serde-saphyr = "2.0.0"
+sha2 = "0.10.9"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "process", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = { version = "0.14.0", features = ["ring"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring"] }
+mysql_async = { version = "=0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+aws-credential-types = "1"
+aws-sigv4 = { version = "1", features = ["sign-http"] }
+url = "2"
+ipnet = { version = "2", features = ["serde"] }
+libc = "0.2"
+rusqlite = { version = "=0.41.0", default-features = false, features = ["fallible_uint", "bundled"] }
+
+[build-dependencies]
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

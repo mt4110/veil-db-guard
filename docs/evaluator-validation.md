@@ -1,0 +1,15 @@
+# 判定器・レポートのローカル検証
+
+2026-11-02時点。実施したのは純粋な判定処理とレポートのローカル検証です。AWSへの認証・接続・構成変更は実施していません。以下の合成記録はAWSの実測証拠ではありません。
+
+`cargo test --test evaluation --locked`で35件を確認しました。固定必須caseの欠落、反復による水増し、古いfailの持越し、対象・設定・build・時刻の不一致、ローカル証拠のAWS昇格、認証拒否とTLS拒否と直接経路閉鎖の混同、任意文字列の混入を反例にしています。ローカル契約profileと、十分な合成protocol記録を揃えたAWS core profileがそれぞれ評価可能であることも確認しました。
+
+phaseをまたぐ判定は、事前の計画hash、phaseの正規化設定、前後の実snapshot、参照artifact、許可した差分の値hash、実際の接続結果を照合します。復旧は故障側の観測と操作ID、復帰後の行数・書込回数・再送回数を要求します。復旧後のV06〜V09を以前のphaseの記録で代用しません。
+
+性能比較は両側の生サンプルから標本数・p95・エラー率を検算し、workload、driver、DB resource ID、実snapshotのclass/AZ、送信元、接続元種別、address family、runner条件、並行数、warmup、retry、TLS、観測したpinning条件を照合します。同じpath/caseでも別のprotected phaseの計測を流用しません。閾値に違反した有効な計測を、成功したretryで隠しません。
+
+AWSのpassに旧式のFact自己申告や単一snapshotだけを使う経路はありません。protocol・必要な実観測が不足すればUnknownです。SourceVerification::Declaredを自動でCorroboratedへ昇格しません。送信元の客観照合、AWS資格情報の期限、CloudWatch等によるpinning観測、DNS・ネットワーク経路の故障注入について、実AWSで十分な記録を生成できたとは扱いません。
+
+現在のprotocolはprotected/recovered間のpath/source集合変更をサポートせず、設定不一致として拒否します。既存DB導入、デコイ、継続確認、利用者検証の将来caseはUnknownのままです。
+
+manifestとhashの検査は保存事故と参照の不一致を検出するためのものです。入力記録・外部事実の真正性、悪意ある作成者に対する改ざん耐性、全主体・全経路の安全を保証しません。合成fixtureの成功をM3の実AWS防御成立へ読み替えません。

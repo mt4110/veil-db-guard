@@ -1,0 +1,27 @@
+# Rust's exact version has one source of truth: rust-toolchain.toml.
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tasks.build]
+description = "Build with locked dependencies, without network access"
+run = "cargo build --locked --offline"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Check all targets with Clippy"
+run = "cargo clippy --locked --offline --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run local regression checks; explicit DB labs stay ignored"
+run = "cargo test --locked --offline"
+
+[tasks.check]
+description = "Run formatting, static analysis and local regression checks"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --locked --offline --all-targets -- -D warnings",
+  "cargo test --locked --offline",
+]

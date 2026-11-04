@@ -1,0 +1,53 @@
+# Synthetic identifiers only; this file does not point to an AWS account.
+schema_version: 1
+assessment_profile: local_contract_v1
+experiment_id: local-demo
+phase_id: protected
+configuration_epoch: epoch-1
+target:
+  id: synthetic-db
+  account_id: '000000000000'
+  region: ap-northeast-1
+  db_instance_arn: arn:aws:rds:ap-northeast-1:000000000000:db:vdg-demo
+  proxy_arn: arn:aws:rds:ap-northeast-1:000000000000:db-proxy:prx-00000000000000000
+  proxy_name: vdg-demo
+  engine: postgres
+  engine_version: '16.15'
+auth:
+  mode: end_to_end_iam
+  db_user: vdg_probe
+sources:
+  - id: application
+    kind: local_lab
+  - id: administrator
+    kind: local_lab
+paths:
+  - id: application-proxy
+    source_id: application
+    actor: application
+    destination: proxy
+    expected: allow
+    address_family: ipv4
+  - id: application-db
+    source_id: application
+    actor: application
+    destination: database
+    expected: deny
+    address_family: ipv4
+  - id: administrator-db
+    source_id: administrator
+    actor: admin
+    destination: database
+    expected: allow
+    address_family: ipv4
+    exception_code: sandbox_admin
+test_scope:
+  database: vdg_lab
+  schema_prefix: vdg_probe
+  db_user: vdg_probe
+performance_profile:
+  workload_id: fixed-select-v1
+  samples: 30
+  warmup: 3
+  max_p95_ms: 100
+  max_error_rate: 0.0

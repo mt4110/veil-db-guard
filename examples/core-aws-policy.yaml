@@ -1,0 +1,83 @@
+# Synthetic existing-resource references. This file performs no cloud operations.
+schema_version: 1
+policy_id: billing-aws-protection
+revision: 1
+subjects:
+  - id: billing-app
+    kind: application
+    identity:
+      provider: aws
+      principal: arn:aws:iam::123456789012:role/billing-app
+      immutable_id: AROA00000000000000001
+      credential_source: {kind: workload_identity, reference: billing-aws-workload}
+    workload_sources: [billing-runtime]
+  - id: recovery-operator
+    kind: operator
+    identity:
+      provider: aws
+      principal: arn:aws:iam::123456789012:role/veil-recovery
+      immutable_id: AROA00000000000000002
+      credential_source: {kind: native_sdk, reference: recovery-aws-profile}
+    workload_sources: [recovery-runtime]
+targets:
+  - id: billing-db
+    registration_id: billing-aws-registration
+    placement: {kind: aws_rds, account_id: '123456789012', region: ap-northeast-1}
+    resource: {native_id: 'arn:aws:rds:ap-northeast-1:123456789012:db:billing-postgres'}
+    engine: {family: postgre_sql, version: '16.15', database: billing}
+    managed_surface:
+      fields: [aws_iam_binding, aws_security_group_rule, aws_proxy, db_login, db_role, db_object_privilege, application_binding]
+      db_identities: [billing_app, billing_reader_writer]
+      sql_scopes: [{database: billing, kind: schema, schema: billing}]
+    aws:
+      db_resource_id: db-EXAMPLE000000000000000001
+      db_endpoint: billing-postgres.example.ap-northeast-1.rds.amazonaws.com
+      proxy_name: billing-proxy
+      proxy_arn: arn:aws:rds:ap-northeast-1:123456789012:db-proxy:prx-example0001
+      proxy_endpoint: billing-proxy.proxy-example.ap-northeast-1.rds.amazonaws.com
+      proxy_role_arn: arn:aws:iam::123456789012:role/veil-proxy-backend
+      proxy_role_id: AROA00000000000000003
+      proxy_policy_name: veil-billing-backend
+      proxy_security_group_id: sg-proxy0001
+      db_security_group_id: sg-database0001
+      managed_policy_name: veil-billing-application
+      management_db_identity: veil_recovery
+      owned_direct_rules:
+        - rule_id: sgr-direct0001
+          protocol: tcp
+          from_port: 5432
+          to_port: 5432
+          source: {kind: cidr_v4, cidr: '203.0.113.0/24'}
+          ownership_tag_key: 'veil-db-guard:ownership'
+          ownership_tag_value: billing-aws-protection
+grants:
+  - id: billing-access
+    subject: billing-app
+    target: billing-db
+    db_identity: billing_app
+    admission: allow
+    sql_access:
+      existing_roles: [billing_reader_writer]
+      privileges:
+        - scope: {database: billing, kind: table, schema: billing, object: invoices}
+          actions: [read, insert, update]
+    profile: aws-protected
+    lifetime: {kind: standing}
+protection_profiles:
+  - id: aws-protected
+    kind: aws_rds_postgres_proxy_v1
+    allowed_routes:
+      - {id: app-proxy, kind: native_proxy, source_ids: [billing-runtime]}
+      - {id: recovery-proxy, kind: native_proxy, source_ids: [recovery-runtime]}
+    application_direct_path: {kind: deny}
+    authentication: native_iam
+    encryption: verified_tls
+    management_exceptions:
+      - id: independent-recovery
+        subject: recovery-operator
+        source_ids: [recovery-runtime]
+        route_id: recovery-proxy
+        reason_code: recovery
+        lifetime: {kind: standing}
+        recovery: true
+    required_effects: [binding_applied, new_connections_allowed, new_connections_denied, sql_privileges_applied]

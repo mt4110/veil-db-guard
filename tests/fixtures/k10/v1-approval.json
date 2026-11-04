@@ -1,0 +1,26 @@
+{
+  "allowed_repair_recipe_hashes": [],
+  "allowed_step_ids": [
+    "billing-access-step-0",
+    "billing-access-step-1",
+    "billing-access-step-2",
+    "billing-access-step-3",
+    "billing-access-step-4",
+    "billing-access-step-5",
+    "billing-access-step-6",
+    "billing-access-step-7"
+  ],
+  "approval_hash": "b73c564e0fa16e33c3725dc7747a796caccfd6a0e62b8646b3c967e888a9869e",
+  "approver": "local-reviewer",
+  "change_hash": "1e4dff9ebe6883e54398924bf4bdda28ec3ccff0bd8db2d7b0ff23ecabd7faac",
+  "execution_identity": "offline-runner",
+  "forward_valid_until": 1793615973,
+  "id": "supported-approval",
+  "issued_at": 1793615673,
+  "limits_hash": "79f6d922cce3e2d1cf87c97c61df7846b32acbb89e48e1efd147600beeaa2161",
+  "policy_revision_hash": "b7245e515bc39bb3b30299fd2b074097c3eb1c7336c7f2c9c5fa51a42ef9cfd6",
+  "recovery_scope_hash": "894fe6b6fbf120a309106e575ca837418368d3e63c8b768bc20c61f85aa085d9",
+  "recovery_valid_until": 1793616573,
+  "schema_version": 1,
+  "target_scope_hash": "00a175a7f44a5205c5520ac404e23dcea8b99aa771acaf9b329f78c19ee6d478"
+}

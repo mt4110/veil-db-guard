@@ -1,0 +1,40 @@
+# Synthetic configuration. Replace target and principals with your declared lab.
+# This sample project is rejected by live CLI checks before credentials are used.
+schema_version: 1
+target:
+  project_id: vdg-example-000000
+  instance_id: vdg-pg-lab
+  region: asia-northeast1
+  engine_version: POSTGRES_16_15
+  database: vdg_lab
+principals:
+  - id: application
+    service_account: vdg-allowed@vdg-example-000000.iam.gserviceaccount.com
+  - id: unauthorized
+    service_account: vdg-denied@vdg-example-000000.iam.gserviceaccount.com
+cases:
+  - id: application-proxy
+    principal_id: application
+    route: proxy
+    expected: allow
+  - id: unauthorized-proxy
+    principal_id: unauthorized
+    route: proxy
+    expected: deny
+    expected_denial: connect_iam
+  - id: application-direct
+    principal_id: application
+    route: direct
+    expected: deny
+    expected_denial: network_blocked
+permission_changes: []
+pending_window_seconds: 600
+max_age_seconds: 3600
+limits:
+  connect_timeout_ms: 15000
+  query_timeout_ms: 15000
+  total_timeout_ms: 180000
+  max_concurrency: 1
+  max_retries: 0
+  max_results: 1000
+  max_bytes: 8388608

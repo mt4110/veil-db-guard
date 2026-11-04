@@ -1,0 +1,71 @@
+schema_version: 1
+policy_id: billing-protection
+revision: 1
+subjects:
+  - id: billing-app
+    kind: application
+    identity:
+      provider: gcp
+      principal: billing-app@vdg-example-000000.iam.gserviceaccount.com
+      credential_source:
+        kind: workload_identity
+        reference: billing-workload
+    workload_sources: [billing-runtime]
+  - id: recovery-operator
+    kind: operator
+    identity:
+      provider: gcp
+      principal: recovery@vdg-example-000000.iam.gserviceaccount.com
+      credential_source:
+        kind: native_sdk
+        reference: recovery-native-identity
+    workload_sources: [recovery-runtime]
+targets:
+  - id: billing-db
+    registration_id: billing-db-registration
+    placement:
+      kind: gcp_cloud_sql
+      account_id: vdg-example-000000
+      region: asia-northeast1
+    resource:
+      native_id: projects/vdg-example-000000/instances/billing-postgres
+    engine:
+      family: postgre_sql
+      version: '16.15'
+      database: billing
+    managed_surface:
+      fields: [gcp_database_flag, gcp_iam_binding, gcp_connector_enforcement, db_login, db_role, db_object_privilege, application_binding]
+      db_identities: [billing-app@vdg-example-000000.iam, billing-reader-writer]
+      sql_scopes:
+        - {database: billing, kind: schema, schema: billing}
+grants:
+  - id: billing-access
+    subject: billing-app
+    target: billing-db
+    db_identity: billing-app@vdg-example-000000.iam
+    admission: allow
+    sql_access:
+      existing_roles: [billing-reader-writer]
+      privileges:
+        - scope: {database: billing, kind: table, schema: billing, object: invoices}
+          actions: [read, insert, update]
+    profile: gcp-protected
+    lifetime: {kind: standing}
+protection_profiles:
+  - id: gcp-protected
+    kind: gcp_cloud_sql_postgres_connector_v1
+    allowed_routes:
+      - {id: app-connector, kind: native_connector, source_ids: [billing-runtime]}
+      - {id: recovery-connector, kind: native_connector, source_ids: [recovery-runtime]}
+    application_direct_path: {kind: deny}
+    authentication: native_iam
+    encryption: verified_tls
+    management_exceptions:
+      - id: independent-recovery
+        subject: recovery-operator
+        source_ids: [recovery-runtime]
+        route_id: recovery-connector
+        reason_code: recovery
+        lifetime: {kind: standing}
+        recovery: true
+    required_effects: [binding_applied, new_connections_allowed, new_connections_denied, sql_privileges_applied]
